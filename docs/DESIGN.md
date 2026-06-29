@@ -25,6 +25,8 @@ spirit; everything else is new.
 - **One CLI, two roles:** the same binary runs the central server *and* the local bridge.
 - **Per-machine keys under a user**, with individually addressable sessions.
 - **Channels** (public / unlisted / private) and **whispers** (to exactly one session).
+- **Local autonomy levels** (`muted`/`notify`/`converse`/`act`) controlling how an inbound message
+  may drive the agent, enforced by tool-gating — not just by prompt.
 - **Simple presence:** online == a live connection; bridge down == offline.
 - **TLS transport**, server-trusted, with an **E2E-ready wire format**.
 
@@ -36,7 +38,8 @@ spirit; everything else is new.
 - **CC ↔ bridge encryption** — the local stdio hop is plaintext in v1.
 - **NAT traversal / P2P** — unnecessary: bridges dial *out* to central and everything relays
   through it.
-- **Hidden / invisible presence** — a `hide` flag is a later add.
+- **Hidden / invisible presence** — a `hide` flag (others can't see you're online) is a later add.
+  Note this is distinct from `muted` (§8), which is a receive-side filter and keeps you visible.
 
 ## 4. Core mechanism (the thing that makes this possible)
 
@@ -117,14 +120,52 @@ the member set). A non-expiring, multi-use token *is* a standing password — so
   `kind`. Outbound tools take a `server` arg, defaulting to the sole/last connection when
   unambiguous.
 
-## 8. Presence
+## 8. Permission levels (local autonomy policy)
+
+How much an inbound message is allowed to drive *your* agent is a **local** choice — set on the
+bridge/CLI side, **never on the server** (the server doesn't know or enforce a recipient's
+autonomy policy; it's the recipient's private business). A level is **two things at once**: the
+surrounding prompt the bridge injects, *and* the set of outbound tools it exposes. So the
+constraint is enforced by **capability, not just instruction** (constitution #7) — at `notify`,
+the bridge simply doesn't hand Claude the emit tools, making "tell me but don't auto-respond"
+physically true rather than hoped-for.
+
+Ascending autonomy:
+
+| Level | Delivery + surrounding prompt | Emit tools (`send`/`whisper`) |
+|---|---|---|
+| **muted** | nothing injected; the message is dropped on your side | n/a |
+| **notify** *(default)* | injected read-only: "surface to the human; do **not** reply or act" | **withheld** |
+| **converse** | injected: "you may reply/whisper in conversation; do **not** take side-effecting actions" | available |
+| **act** | injected: "you may reply **and** act on this" | available |
+
+- **muted** suppresses delivery entirely (lurk). Distinct from *leaving* (which drops presence)
+  and from a future `hide` flag (which hides presence) — when muted you stay visible/present, you
+  just aren't pinged.
+- **notify / converse / act** all deliver; the ladder is how much initiative the agent may take.
+- **Enforced where conclave has authority:** at `muted`/`notify` the emit tools aren't offered, so
+  the agent *cannot* respond into the fabric. `converse` vs `act` differ by framing; local
+  side-effecting actions (`bash`, edits) are Claude Code's own permission domain, steered by the
+  framing **and** the permission-relay (§11), not controlled by conclave directly. **So `act` ≠
+  unsupervised** — the relay stays your remote approval gate on dangerous tool calls.
+
+**Scope, storage & resolution (local):**
+
+- Machine-level **default** in `~/.config/conclave/config.toml` (ships `notify`).
+- **Per-channel** override; **whispers** are their own scope (default `notify`).
+- Resolution: per-channel (or whisper) override → machine default.
+- Set via `conclave perm set <level> [--channel <name> | --whisper] [--server S]`, via the
+  `/join --perm <level>` flag, and changeable live (takes effect on the next inbound message).
+  `conclave perm show` prints the resolved table.
+
+## 9. Presence
 
 - **Online == the bridge holds a live connection to central. Bridge down == offline.**
 - Central holds the connections, so **"who's online" is a central query** — you never poll a
   peer's bridge.
 - **No store-and-forward:** offline means you miss the message.
 
-## 9. Transport & crypto
+## 10. Transport & crypto
 
 - **bridge ↔ central:** **WebSocket over TLS (WSS)** — one long-lived *outbound* connection per
   `(session, server)`. Outbound-only dialing means no inbound-NAT problem, and **cloudflared
@@ -139,35 +180,40 @@ the member set). A non-expiring, multi-use token *is* a standing password — so
   North star: **MLS (RFC 9420)**. The v1 wire format is designed now to carry opaque ciphertext +
   key metadata so adding E2E doesn't break the protocol.
 
-## 10. Components (each a single responsibility)
+## 11. Components (each a single responsibility)
 
 1. **central server** (`conclave serve`) — axum WSS endpoint + control RPCs; SurrealDB-backed
    identity / channel / ACL store; in-memory presence + fan-out router.
 2. **bridge** (`conclave bridge`) — a dual peer: a stdio **MCP server** (to Claude Code) and a
    **WS client** to one or more central servers. Translates inbound central events → MCP channel
-   notifications, and MCP tool calls → outbound central messages. Owns the session identity and
-   its connections.
-3. **identity / keystore** — local keypair management under `~/.config/conclave/` (one identity
-   per machine), signing, registration state, and the known-servers list.
+   notifications, and MCP tool calls → outbound central messages. Owns the session identity, its
+   connections, and the **permission policy**: for each inbound message it resolves the channel's
+   level, drops it when `muted`, and otherwise injects the level's surrounding prompt while exposing
+   the emit tools only at `converse`/`act`.
+3. **identity / keystore** — local state under `~/.config/conclave/`: the per-machine keypair,
+   signing, registration state, the known-servers list, and the permission config (default level +
+   per-channel/whisper overrides).
 4. **protocol / wire types** — the shared frame schema (control + data) between bridge and central,
    designed E2E-ready.
 5. **CLI** — arg parsing + dispatch (`serve`, `bridge`, `key`, `register`, `machine …`,
-   `channel …`, `invite …`).
+   `channel …`, `invite …`, `perm …`).
 6. **`/join` skill** — the Claude Code-side UX: ensures the bridge is registered as an MCP server
-   for the session, then calls its `join_channel` tool.
+   for the session, then calls its `join_channel` tool (optionally with `--perm`).
 
-## 11. Data flow
+## 12. Data flow
 
 - **Inbound** (peer → your agent): sender's bridge → WS → central → fan-out to subscribed sessions'
-  bridges → MCP `notifications/claude/channel` → `<channel>` / `<whisper>` tag in the session.
+  bridges → each bridge resolves the channel's permission level → **if `muted`, drop**; otherwise
+  inject `notifications/claude/channel` with that level's surrounding prompt (emit tools exposed
+  only at `converse`/`act`) → `<channel>` / `<whisper>` tag in the session.
 - **Outbound** (your agent → peer): CC tool call (`send_channel` / `whisper`) → bridge → WS →
   central → route (channel fan-out, or single-session whisper).
 - **Control:** register / machine add / join / who → CLI or tool → central RPC → SurrealDB +
   presence table.
 - **Permissions** (carried from the prototype): the bridge relays `claude/channel/permission_request`
-  outbound and applies the returned verdict.
+  outbound and applies the returned verdict — the remote human approval gate referenced in §8.
 
-## 12. SurrealDB schema (central — durable config only)
+## 13. SurrealDB schema (central — durable config only)
 
 - `user      { username UNIQUE, created_at }`
 - `machine   { user, name, pubkey UNIQUE, added_at }`  — `name` unique within a user
@@ -175,9 +221,10 @@ the member set). A non-expiring, multi-use token *is* a standing password — so
 - `invite    { channel, token, uses_remaining?, expires_at?, created_by }`
 
 **Not in the DB:** live presence + channel subscriptions (in-memory, tied to WS connections);
-message history (there is none).
+message history (there is none); **permission levels** (those are local bridge config — §8 — and
+never leave the recipient's machine).
 
-## 13. Error handling
+## 14. Error handling
 
 - Bridge **reconnects** to central on drop (backoff) and **re-subscribes** joined channels on
   reconnect; central marks the session offline on disconnect.
@@ -186,25 +233,29 @@ message history (there is none).
   is queued).
 - Missing experimental capability (CC drift) → the bridge surfaces a clear message at MCP handshake.
 
-## 14. Testing
+## 15. Testing
 
-- **Unit:** sign/verify, ACL checks, token redemption, address parsing, visibility gating.
+- **Unit:** sign/verify, ACL checks, token redemption, address parsing, visibility gating,
+  permission-level resolution + tool-gating (muted drops; notify withholds emit; converse/act expose
+  it).
 - **Integration:** spin up `serve` + two `bridge` clients in-process; exercise register → machine
-  add → join → channel message → whisper → presence → reconnect.
+  add → join → channel message → whisper → presence → reconnect, across permission levels.
 - **MCP:** a mock MCP client asserts the bridge emits `notifications/claude/channel` and handles
   tool calls. Plus the manual **M0** smoke test against the installed Claude Code.
 
-## 15. Build order (milestones)
+## 16. Build order (milestones)
 
 - **M0** — smoke-test experimental `claude/channel` on the current CC (de-risk the foundation).
 - **M1** — wire types + identity/keystore + SurrealDB schema.
 - **M2** — central `serve`: register, machine add, auth, channel create, ACL, presence, fan-out.
-- **M3** — `bridge`: MCP stdio peer + WS client; inbound injection + outbound tools.
-- **M4** — control verbs + `/join` skill.
-- **M5** — reconnect/presence hardening, invite tokens, visibility tiers.
+- **M3** — `bridge`: MCP stdio peer + WS client; inbound injection + outbound tools; permission
+  levels (`muted`/`notify`/`converse`/`act`) with tool-gating + the machine default.
+- **M4** — control verbs + `/join` skill (incl. `--perm`).
+- **M5** — reconnect/presence hardening, invite tokens, visibility tiers, per-channel/whisper
+  permission overrides + live `conclave perm set`.
 - **v2** — E2E encryption, account recovery, hide flag.
 
-## 16. Naming
+## 17. Naming
 
 `conclave` — a private assembly that deliberates in secret. The crate is published as
 **`conclave-cli`** (the bare `conclave` name is an abandoned crates.io squat) with
@@ -212,7 +263,7 @@ message history (there is none).
 (free); domain `conclave.rs` available. Known collision: **R3's Conclave** (JVM/Intel-SGX
 confidential computing) — a different niche, accepted.
 
-## 17. Stack
+## 18. Stack
 
 Rust · tokio · **axum** (hyper + tower) for the central server · **tokio-tungstenite** for the
 bridge's WS client · **SurrealDB** for central durable state · Ed25519 for identity · rustls/WSS
