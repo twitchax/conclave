@@ -260,8 +260,9 @@ framing **and** the permission-relay (§12) — conclave does not control them d
    signing, per-server registrations (username + machine name), the known-servers list, and the
    permission config (default + per-`(server, channel)`/whisper overrides).
 4. **protocol / wire types** — the shared frame schema (control + data) between bridge and central.
-   **E2E-ready from day one:** the data frame reserves an opaque encrypted-payload envelope + key-id
-   so adding E2E (§19) is additive, not a breaking change.
+   Carries a **protocol-version field** negotiated at connect (server rejects/upgrades incompatible
+   peers) for forward-compat. **E2E-ready from day one:** the data frame reserves an opaque
+   encrypted-payload envelope + key-id so adding E2E (§19) is additive, not a breaking change.
 5. **CLI** — arg parsing + dispatch (`serve`, `bridge`, `key`, `register`, `machine …`,
    `channel …`, `acl …`, `invite …`, `kick`, `ban`, `user …`, `perm …`, `join`).
 6. **`/join` skill** — the Claude Code-side UX. The `conclave` bridge is installed **once** as an
