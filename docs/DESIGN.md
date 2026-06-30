@@ -330,6 +330,11 @@ message history (none); **permission levels** (local bridge config, §9); **serv
 
 ## 18. Build order (milestones)
 
+- **M0** — **project scaffolding & hygiene** (§22): repo skeleton with the lib+bin SOC stubs, lints
+  + profiles + `rustfmt.toml`, `cargo-make` (`ci` gate), CI (lint/test/codecov/platform +
+  `copilot-setup-steps`), `.config/nextest.toml`, the unit/integration/e2e harness skeleton with
+  fixtures + helpers, README/CHANGELOG/DEVELOPMENT/CLAUDE.md, and `.prds/`. Quality is the substrate,
+  not a retrofit. (Includes the stable-vs-nightly toolchain decision.)
 - **M1** — wire types (with the E2E-ready envelope reserved) + identity/keystore + embedded
   SurrealDB schema/repo.
 - **M2** — central `serve`: register, machine add/remove + revocation, challenge-response auth +
@@ -376,4 +381,77 @@ confidential computing) — a different niche, accepted.
 Rust · tokio · **axum** (hyper + tower) for the central server · **tokio-tungstenite** for the
 bridge's WS client · **SurrealDB** embedded via the official `surrealdb` SDK + a thin repository
 layer (no third-party ORM; live queries are the future multi-instance lever) · Ed25519 for identity
-· rustls/WSS for transport.
+· rustls/WSS for transport · `thiserror` (typed boundary errors) + `anyhow` (app glue) · `secrecy`
+for private-key material · `clap` (derive) CLI · `tracing` + `tracing-subscriber`. Dev/tooling:
+`cargo-make`, `cargo-nextest`, `cargo-llvm-cov`, `criterion`, `pretty_assertions`, `git-cliff`.
+
+## 22. Engineering conventions & project hygiene
+
+Conclave adopts the house conventions proven in **kord**, **razel**, and **ratrod** — ratrod (the
+newest; a tokio network service) is the closest structural template. This is **M0** (§18): scaffold
+the repo with all of this in place *before* feature work, so quality is the substrate, not a
+retrofit. The global Rust constitution (`~/CLAUDE.md`) applies on top.
+
+- **Toolchain & edition.** Pinned via `rust-toolchain.toml`. *Open decision for your pass:* the
+  example repos pin **nightly** (only for `#[coverage(off)]` / a few unstable features); conclave
+  needs none of that, so I recommend **stable Rust, edition 2024** — friendlier for an OSS network
+  project and immune to nightly drift. Flagging because it diverges from the ecosystem's nightly pin.
+- **Lints (razel's set — the strongest).** Via the Cargo `[lints]` table (DRY across lib + bin):
+  `deny(unused, clippy::unwrap_used, clippy::correctness, clippy::complexity, clippy::pedantic)`,
+  with narrow `allow`s only for macro-codegen false positives; tests relax `clippy::unwrap_used`.
+  Gate = `cargo clippy --all-targets --all-features -- -D warnings`. Suppressing
+  `too_many_arguments` / `too_many_lines` / `needless_pass_by_value` is prohibited — extract a
+  struct / helper / borrow instead.
+- **Formatting (kord & ratrod, byte-identical — the canonical rustfmt).** `max_width = 200`,
+  `struct_lit_width = 40`, `reorder_impl_items = true`, `format_macro_bodies = false`,
+  `format_code_in_doc_comments = true`. CI runs `fmt --check`.
+- **Profiles (razel).** `release` (`opt-level=3, lto=true, codegen-units=1, strip=true`),
+  `dev-release` (fast iterate), `profiling` (`debug=2, lto=false`) — the `profiling` profile backs
+  the Performance constitution's "measure hot paths with `criterion`."
+- **Error handling (hybrid).** `thiserror` typed errors for boundaries that cross the wire or get
+  matched on — `ProtocolError`, `AuthError`, `AclError` (ratrod has a `ProtocolError`); `anyhow` +
+  the alias trio `pub type Err / Res<T> / Void` (ratrod, kord) for app glue. `?` + `.context(…)`,
+  never `unwrap` outside tests. Per-connection `tracing::info_span!("conn", id=…)` with full
+  `anyhow` error-chain logging (ratrod).
+- **Source layout & SOC (ratrod's template, mapped to §13).** Thin **bin** (`conclave`: `clap`
+  derive + tracing init + dispatch) over a **lib** (`conclavelib`): `base` (a `Constant` struct for
+  magic values + the type aliases + domain types), `protocol` (wire frames, E2E-ready envelope,
+  ser/de), `identity` (keypair gen/sign, `~/.config/conclave`, `secrecy`-wrapped keys), `server`
+  (axum WSS, RPCs, presence, fan-out, SurrealDB repo), `bridge` (MCP stdio peer + WS client).
+  **Typestate** for connection lifecycle (`Instance<Config> → Instance<Ready>`, ratrod).
+- **Testing SOC (razel 3-tier + ratrod harness).**
+  - *Unit:* in-module `#[cfg(test)] mod tests`; shared helpers via a `pub mod tests` exporting
+    duplex/key factories (ratrod).
+  - *Integration:* `tests/*.rs`, one bounded subsystem each (challenge-response auth, ACL +
+    visibility, invite redemption, permission resolution, protocol round-trip), using in-memory
+    `tokio::io::duplex()` where possible to avoid sockets.
+  - *E2E:* `tests/e2e.rs` spawns real `conclave serve` + two `conclave bridge` via
+    `env!("CARGO_BIN_EXE_conclave")` in `tempfile::TempDir`, with **staggered ports** + fixture key
+    dirs (ratrod), asserting register → join (multi-server) → channel-msg → whisper →
+    presence/heartbeat → reconnect → admin → revocation.
+  - *Config:* `.config/nextest.toml` with **`retries = 2`** and a serialized **`network-heavy`
+    test-group** (razel) — essential for socket/timing flakiness. `pretty_assertions` everywhere.
+    `criterion` benches (`harness=false`) for hot paths: protocol ser/de, fan-out, crypto.
+  - *Discipline:* every behavioral change ships a test — no exceptions (razel).
+- **Task runner — `cargo-make` (kord/razel).** Every task `workspace = false` + explicit `cwd`.
+  Tasks: `fmt`, `fmt-check`, `clippy`, `build`/`build-release`/`build-profiling`, `test` (nextest) /
+  `test-cargo` fallback, `codecov`/`codecov-html`, `install-*` via `cargo binstall … --no-confirm
+  --locked`, a `tools` aggregate, and the canonical gate **`ci = [fmt-check, clippy, test]`** (+
+  `uat` once PRDs define UATs).
+- **CI (razel structure, ratrod's clean cross-compile).** Preamble: `checkout` →
+  `dtolnay/rust-toolchain` (from `rust-toolchain.toml`) → `Swatinem/rust-cache@v2`
+  (`cache-all-crates`) → `cargo-bins/cargo-binstall@main` → `cargo binstall cargo-make` → `cargo
+  make <task>`. Jobs: **lint** (`fmt-check` + `clippy -D warnings`), **test** (`cargo make test`),
+  **codecov** (`cargo llvm-cov nextest --lcov` → `codecov-action@v5`), **platform builds** gated to
+  `main` (linux native; windows via `cross`; macos native). Plus **`copilot-setup-steps.yml`**
+  (kord) bootstrapping the agent env (one binstall line + `cargo fetch`). *(Enforcing fmt+clippy in
+  CI is stricter than kord/ratrod — matching razel and the constitution.)*
+- **Docs & release hygiene.** README: **badge row** (CI, codecov, crates version, downloads,
+  docs.rs, license) → one-liner → **Usage** (`--help` verbatim) → **Install** → **Protocol**
+  (**Mermaid sequence diagrams** of the auth handshake, channel fan-out, whisper, and
+  permission-relay — ratrod does this and it fits conclave perfectly) → **Development** (cargo-make
+  cmds) → **Architecture** (module tree) → License. Module `//!` + `///` on every public item
+  (doctests double as docs, kord). `DEVELOPMENT.md` contributor guide; `CHANGELOG.md` Keep-a-Changelog
+  + SemVer via **git-cliff**; `cargo-release --no-publish` for version bumps, publish as a separate
+  manual step. `CLAUDE.md` encodes conclave-specifics; PRDs live in **`.prds/`** (razel) — M1–M5
+  become PRDs.
