@@ -25,7 +25,7 @@ spirit; everything else is new.
 - **One CLI, two roles:** the same binary runs the central server *and* the local bridge.
 - **Per-machine keys under a user**, with individually addressable sessions.
 - **Channels** (public / unlisted / private) and **whispers** (to exactly one session).
-- **Local autonomy levels** (`muted`/`notify`/`converse`/`act`) controlling how an inbound message
+- **Local autonomy levels** (`mute`/`notify`/`converse`/`act`) controlling how an inbound message
   may drive the agent, enforced by tool-gating — not just by prompt.
 - **Simple presence:** online == a live connection; bridge down == offline.
 - **TLS transport**, server-trusted, with an **E2E-ready wire format**.
@@ -39,7 +39,7 @@ spirit; everything else is new.
 - **NAT traversal / P2P** — unnecessary: bridges dial *out* to central and everything relays
   through it.
 - **Hidden / invisible presence** — a `hide` flag (others can't see you're online) is a later add.
-  Note this is distinct from `muted` (§8), which is a receive-side filter and keeps you visible.
+  Note this is distinct from `mute` (§8), which is a receive-side filter and keeps you visible.
 
 ## 4. Core mechanism (the thing that makes this possible)
 
@@ -134,16 +134,16 @@ Ascending autonomy:
 
 | Level | Delivery + surrounding prompt | Emit tools (`send`/`whisper`) |
 |---|---|---|
-| **muted** | nothing injected; the message is dropped on your side | n/a |
+| **mute** | nothing injected; the message is dropped on your side | n/a |
 | **notify** *(default)* | injected read-only: "surface to the human; do **not** reply or act" | **withheld** |
 | **converse** | injected: "you may reply/whisper in conversation; do **not** take side-effecting actions" | available |
 | **act** | injected: "you may reply **and** act on this" | available |
 
-- **muted** suppresses delivery entirely (lurk). Distinct from *leaving* (which drops presence)
-  and from a future `hide` flag (which hides presence) — when muted you stay visible/present, you
-  just aren't pinged.
+- **mute** suppresses delivery entirely (lurk). Distinct from *leaving* (which drops presence)
+  and from a future `hide` flag (which hides presence) — when set to `mute` you stay visible/present,
+  you just aren't pinged.
 - **notify / converse / act** all deliver; the ladder is how much initiative the agent may take.
-- **Enforced where conclave has authority:** at `muted`/`notify` the emit tools aren't offered, so
+- **Enforced where conclave has authority:** at `mute`/`notify` the emit tools aren't offered, so
   the agent *cannot* respond into the fabric. `converse` vs `act` differ by framing; local
   side-effecting actions (`bash`, edits) are Claude Code's own permission domain, steered by the
   framing **and** the permission-relay (§11), not controlled by conclave directly. **So `act` ≠
@@ -188,7 +188,7 @@ Ascending autonomy:
    **WS client** to one or more central servers. Translates inbound central events → MCP channel
    notifications, and MCP tool calls → outbound central messages. Owns the session identity, its
    connections, and the **permission policy**: for each inbound message it resolves the channel's
-   level, drops it when `muted`, and otherwise injects the level's surrounding prompt while exposing
+   level, drops it when `mute`, and otherwise injects the level's surrounding prompt while exposing
    the emit tools only at `converse`/`act`.
 3. **identity / keystore** — local state under `~/.config/conclave/`: the per-machine keypair,
    signing, registration state, the known-servers list, and the permission config (default level +
@@ -203,7 +203,7 @@ Ascending autonomy:
 ## 12. Data flow
 
 - **Inbound** (peer → your agent): sender's bridge → WS → central → fan-out to subscribed sessions'
-  bridges → each bridge resolves the channel's permission level → **if `muted`, drop**; otherwise
+  bridges → each bridge resolves the channel's permission level → **if `mute`, drop**; otherwise
   inject `notifications/claude/channel` with that level's surrounding prompt (emit tools exposed
   only at `converse`/`act`) → `<channel>` / `<whisper>` tag in the session.
 - **Outbound** (your agent → peer): CC tool call (`send_channel` / `whisper`) → bridge → WS →
@@ -236,7 +236,7 @@ never leave the recipient's machine).
 ## 15. Testing
 
 - **Unit:** sign/verify, ACL checks, token redemption, address parsing, visibility gating,
-  permission-level resolution + tool-gating (muted drops; notify withholds emit; converse/act expose
+  permission-level resolution + tool-gating (mute drops; notify withholds emit; converse/act expose
   it).
 - **Integration:** spin up `serve` + two `bridge` clients in-process; exercise register → machine
   add → join → channel message → whisper → presence → reconnect, across permission levels.
@@ -249,7 +249,7 @@ never leave the recipient's machine).
 - **M1** — wire types + identity/keystore + SurrealDB schema.
 - **M2** — central `serve`: register, machine add, auth, channel create, ACL, presence, fan-out.
 - **M3** — `bridge`: MCP stdio peer + WS client; inbound injection + outbound tools; permission
-  levels (`muted`/`notify`/`converse`/`act`) with tool-gating + the machine default.
+  levels (`mute`/`notify`/`converse`/`act`) with tool-gating + the machine default.
 - **M4** — control verbs + `/join` skill (incl. `--perm`).
 - **M5** — reconnect/presence hardening, invite tokens, visibility tiers, per-channel/whisper
   permission overrides + live `conclave perm set`.
