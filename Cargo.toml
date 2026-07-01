@@ -32,11 +32,10 @@ bincode = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
-# Ed25519 via ed25519-dalek (not ring): clean raw-seed round-trip for the on-disk
-# keystore and easy `secrecy`-wrapping of the 32-byte seed. Keygen uses `getrandom`
-# directly (rand 0.10 is incompatible with dalek's rand_core 0.6).
-ed25519-dalek = "2"
-getrandom = "0.2"
+# Ed25519 (and the ECDH / AEAD / HKDF primitives v2 E2E will need) via `ring` — one
+# audited crypto dependency. `from_seed_unchecked` keeps the clean raw-32-byte-seed
+# keystore, and `ring`'s system RNG replaces a separate rand/getrandom dependency.
+ring = { version = "0.17", features = ["std"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 # Embedded SurrealDB via the bare SDK (no ORM). SurrealKV is the pure-Rust on-disk

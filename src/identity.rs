@@ -6,9 +6,9 @@
 //! config (default level + per-`(server, channel)` / whisper overrides, DESIGN.md §9).
 //!
 //! Auth is challenge-response: the machine signs a server-issued nonce and the server resolves the
-//! public key to a `(user, machine)` (DESIGN.md §5). Keys are generated from OS entropy via
-//! `getrandom` and reconstructed from the seed on demand, so the private scalar is only ever
-//! materialized transiently for a signature.
+//! public key to a `(user, machine)` (DESIGN.md §5). Keys are generated from OS entropy via `ring`'s
+//! system RNG and the key pair is reconstructed from the seed on demand, so the private seed is only
+//! ever materialized transiently for a signature.
 
 use std::{
     fmt, fs,
@@ -17,7 +17,10 @@ use std::{
 
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH, Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ring::{
+    rand::{SecureRandom as _, SystemRandom},
+    signature::{self, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey},
+};
 use secrecy::{ExposeSecret as _, SecretBox};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +28,11 @@ use crate::{
     base::{Constant, PermissionLevel, Res, SessionPath, Void},
     protocol::ProtocolError,
 };
+
+/// Byte lengths of an Ed25519 private seed, public key, and signature.
+const SEED_LEN: usize = 32;
+const PUBLIC_KEY_LEN: usize = 32;
+const SIGNATURE_LEN: usize = 64;
 
 /// Errors at the authentication / identity boundary (DESIGN.md §16), matched on by the server.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -64,8 +72,8 @@ impl From<AuthError> for ProtocolError {
 /// The seed never leaves the [`SecretBox`] except transiently to sign or to be persisted to the
 /// (0600) keyfile; the [`fmt::Debug`] impl redacts it.
 pub struct Identity {
-    secret_seed: SecretBox<[u8; SECRET_KEY_LENGTH]>,
-    verifying_key: VerifyingKey,
+    secret_seed: SecretBox<[u8; SEED_LEN]>,
+    public_key: [u8; PUBLIC_KEY_LEN],
 }
 
 impl Identity {
@@ -73,43 +81,49 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// Returns an error if the OS random source cannot be read.
+    /// Returns an error if the OS random source cannot be read or the seed is rejected.
     pub fn generate() -> Res<Self> {
-        let mut seed = [0_u8; SECRET_KEY_LENGTH];
-        getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("failed to gather entropy: {e}"))?;
-        Ok(Self::from_seed(seed))
+        let mut seed = [0_u8; SEED_LEN];
+        SystemRandom::new().fill(&mut seed).map_err(|_| anyhow::anyhow!("failed to gather entropy"))?;
+        Self::from_seed(seed)
     }
 
     /// Reconstructs an identity from its 32-byte seed.
-    #[must_use]
-    pub fn from_seed(seed: [u8; SECRET_KEY_LENGTH]) -> Self {
-        let signing = SigningKey::from_bytes(&seed);
-        let verifying_key = signing.verifying_key();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the seed is rejected by the signing backend.
+    pub fn from_seed(seed: [u8; SEED_LEN]) -> Res<Self> {
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|e| anyhow::anyhow!("invalid Ed25519 seed: {e}"))?;
+        let public_key = key_pair.public_key().as_ref().try_into().context("unexpected public key length")?;
 
-        Self {
+        Ok(Self {
             secret_seed: SecretBox::new(Box::new(seed)),
-            verifying_key,
-        }
+            public_key,
+        })
     }
 
     /// This identity's raw 32-byte public key.
     #[must_use]
-    pub fn public_key(&self) -> [u8; PUBLIC_KEY_LENGTH] {
-        self.verifying_key.to_bytes()
+    pub fn public_key(&self) -> [u8; PUBLIC_KEY_LEN] {
+        self.public_key
     }
 
     /// This identity's public key as a URL-safe base64 string, for display and pasting.
     #[must_use]
     pub fn public_key_base64(&self) -> String {
-        encode_key(&self.public_key())
+        encode_key(&self.public_key)
     }
 
     /// Signs `message` (e.g. a server challenge nonce), returning the 64-byte signature.
-    #[must_use]
-    pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_LENGTH] {
-        // Reconstruct the signing key transiently so the private scalar is not held resident.
-        let signing = SigningKey::from_bytes(self.secret_seed.expose_secret());
-        signing.sign(message).to_bytes()
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signing key cannot be reconstructed from the seed.
+    pub fn sign(&self, message: &[u8]) -> Res<[u8; SIGNATURE_LEN]> {
+        // Reconstruct the key pair transiently so the private seed is not held resident beyond signing.
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(self.secret_seed.expose_secret()).map_err(|e| anyhow::anyhow!("failed to load signing key: {e}"))?;
+        key_pair.sign(message).as_ref().try_into().context("unexpected signature length")
     }
 
     /// The base64 seed, materialized only to persist the keyfile.
@@ -131,13 +145,14 @@ impl fmt::Debug for Identity {
 /// Returns [`AuthError::Malformed`] if the key or signature is the wrong length, or
 /// [`AuthError::BadSignature`] if verification fails.
 pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<(), AuthError> {
-    let key_bytes: [u8; PUBLIC_KEY_LENGTH] = public_key.try_into().map_err(|_| AuthError::Malformed("public key must be 32 bytes".to_owned()))?;
-    let verifying = VerifyingKey::from_bytes(&key_bytes).map_err(|e| AuthError::Malformed(e.to_string()))?;
+    if public_key.len() != PUBLIC_KEY_LEN {
+        return Err(AuthError::Malformed("public key must be 32 bytes".to_owned()));
+    }
+    if signature.len() != SIGNATURE_LEN {
+        return Err(AuthError::Malformed("signature must be 64 bytes".to_owned()));
+    }
 
-    let signature_bytes: [u8; SIGNATURE_LENGTH] = signature.try_into().map_err(|_| AuthError::Malformed("signature must be 64 bytes".to_owned()))?;
-    let signature = Signature::from_bytes(&signature_bytes);
-
-    verifying.verify(message, &signature).map_err(|_| AuthError::BadSignature)
+    UnparsedPublicKey::new(&signature::ED25519, public_key).verify(message, signature).map_err(|_| AuthError::BadSignature)
 }
 
 /// Generates a fresh random challenge nonce (server-side, DESIGN.md §5).
@@ -147,7 +162,7 @@ pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<(),
 /// Returns an error if the OS random source cannot be read.
 pub fn generate_challenge() -> Res<[u8; Constant::CHALLENGE_SIZE]> {
     let mut nonce = [0_u8; Constant::CHALLENGE_SIZE];
-    getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("failed to gather entropy: {e}"))?;
+    SystemRandom::new().fill(&mut nonce).map_err(|_| anyhow::anyhow!("failed to gather entropy"))?;
     Ok(nonce)
 }
 
@@ -265,9 +280,9 @@ pub fn load_identity(dir: &Path) -> Res<Identity> {
     let contents = fs::read_to_string(&key_file).with_context(|| format!("failed to read keyfile `{}` (run `conclave key` first)", key_file.display()))?;
 
     let seed_bytes = decode_key(&contents)?;
-    let seed: [u8; SECRET_KEY_LENGTH] = seed_bytes.as_slice().try_into().context("keyfile does not contain a 32-byte seed")?;
+    let seed: [u8; SEED_LEN] = seed_bytes.as_slice().try_into().context("keyfile does not contain a 32-byte seed")?;
 
-    Ok(Identity::from_seed(seed))
+    Identity::from_seed(seed)
 }
 
 /// Writes the local configuration to `dir/config.toml`.
@@ -338,7 +353,7 @@ mod tests {
         let identity = Identity::generate().unwrap();
         let challenge = generate_challenge().unwrap();
 
-        let signature = identity.sign(&challenge);
+        let signature = identity.sign(&challenge).unwrap();
 
         verify(&identity.public_key(), &challenge, &signature).unwrap();
     }
@@ -348,7 +363,7 @@ mod tests {
         let signer = Identity::generate().unwrap();
         let impostor = Identity::generate().unwrap();
         let challenge = generate_challenge().unwrap();
-        let signature = signer.sign(&challenge);
+        let signature = signer.sign(&challenge).unwrap();
 
         assert_eq!(verify(&impostor.public_key(), &challenge, &signature), Err(AuthError::BadSignature));
     }
@@ -357,7 +372,7 @@ mod tests {
     fn verification_rejects_a_tampered_message_or_signature() {
         let identity = Identity::generate().unwrap();
         let challenge = generate_challenge().unwrap();
-        let mut signature = identity.sign(&challenge);
+        let mut signature = identity.sign(&challenge).unwrap();
 
         let mut tampered_challenge = challenge;
         tampered_challenge[0] ^= 0xFF;
@@ -371,15 +386,15 @@ mod tests {
     fn verification_rejects_a_malformed_key() {
         let identity = Identity::generate().unwrap();
         let challenge = generate_challenge().unwrap();
-        let signature = identity.sign(&challenge);
+        let signature = identity.sign(&challenge).unwrap();
 
         assert!(matches!(verify(&[0_u8; 8], &challenge, &signature), Err(AuthError::Malformed(_))));
     }
 
     #[test]
     fn debug_never_reveals_the_secret_seed() {
-        let seed = [7_u8; SECRET_KEY_LENGTH];
-        let identity = Identity::from_seed(seed);
+        let seed = [7_u8; SEED_LEN];
+        let identity = Identity::from_seed(seed).unwrap();
         let rendered = format!("{identity:?}");
 
         assert!(!rendered.contains(&encode_key(&seed)), "debug output leaked the secret seed: {rendered}");
@@ -404,7 +419,7 @@ mod tests {
 
         // The reloaded key still produces verifiable signatures.
         let challenge = generate_challenge().unwrap();
-        verify(&loaded.public_key(), &challenge, &loaded.sign(&challenge)).unwrap();
+        verify(&loaded.public_key(), &challenge, &loaded.sign(&challenge).unwrap()).unwrap();
     }
 
     #[cfg(unix)]
