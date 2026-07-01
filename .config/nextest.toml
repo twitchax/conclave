@@ -14,3 +14,9 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # suite tail together. Serialize them (they still overlap ordinary cheap tests); membership is
 # assigned via per-test overrides as those tests arrive.
 network-heavy = { max-threads = 1 }
+
+# The `e2e_serve_*` tests spawn a real `conclave serve` on a loopback port; serialize them so
+# concurrent binds don't race for ports.
+[[profile.default.overrides]]
+filter = 'test(/e2e_serve/)'
+test-group = 'network-heavy'

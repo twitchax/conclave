@@ -42,6 +42,20 @@ pub enum Payload {
     Encrypted(Envelope),
 }
 
+/// A channel as surfaced by discovery ([`ProtocolMessage::ChannelList`], DESIGN.md §6).
+///
+/// Only channels the caller is allowed to see are ever listed, so no private name leaks to a
+/// non-member; `member` marks the ones the caller already belongs to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelInfo {
+    /// The channel name.
+    pub name: String,
+    /// The visibility tier.
+    pub visibility: Visibility,
+    /// Whether the requesting user is already a member.
+    pub member: bool,
+}
+
 /// An admin / moderation operation (DESIGN.md §7), authorized server-side by user role.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminOp {
@@ -122,6 +136,15 @@ pub enum AdminOp {
     MachineRemove {
         /// Machine name to revoke.
         name: String,
+    },
+    /// Enroll a new machine key under the authenticated user (self-service, DESIGN.md §5.1).
+    ///
+    /// Appended after `MachineRemove` so existing variant indices are unchanged (forward-compat).
+    MachineAdd {
+        /// Unique-within-user name for the new machine.
+        name: String,
+        /// The new machine's Ed25519 public key (proves possession on its own first connect).
+        pubkey: Vec<u8>,
     },
 }
 
@@ -210,6 +233,37 @@ pub enum ProtocolMessage {
     },
     /// A typed error surfaced to the peer that triggered it.
     Error(ProtocolError),
+    // ---------------------------------------------------------------------
+    // M2 additions — appended after `Error` so every existing variant keeps
+    // its wire index (the append-only, forward-compat discipline of §13).
+    // ---------------------------------------------------------------------
+    /// Client → server: request the channels visible to the authenticated user (discovery).
+    ListChannels,
+    /// Server → client: the discovery result, already visibility-gated.
+    ChannelList {
+        /// The channels the caller may see.
+        channels: Vec<ChannelInfo>,
+    },
+    /// Server → client: a [`ProtocolMessage::Join`] succeeded; the session is now subscribed.
+    Joined {
+        /// The channel that was joined.
+        channel: String,
+    },
+    /// Server → client: a control / admin operation succeeded, with an optional human detail.
+    Ack {
+        /// A short human-readable detail (e.g. the affected name), if any.
+        detail: Option<String>,
+    },
+    /// Server → client: the token minted by an [`AdminOp::InviteCreate`].
+    InviteToken {
+        /// The opaque invite token.
+        token: String,
+    },
+    /// Client → server: liveness keepalive; refreshes presence and draws a [`ProtocolMessage::Pong`]
+    /// (the application-level realization of the §10 heartbeat, uniform across transports).
+    Ping,
+    /// Server → client: keepalive acknowledgement.
+    Pong,
 }
 
 /// Errors that cross the wire as a [`ProtocolMessage::Error`] frame and are matched on by the
@@ -371,6 +425,43 @@ mod tests {
             name: "ops".to_owned(),
             visibility: Visibility::Private,
         }));
+    }
+
+    #[test]
+    fn machine_add_admin_op_round_trips() {
+        assert_round_trips(&ProtocolMessage::Admin(AdminOp::MachineAdd {
+            name: "sno-box".to_owned(),
+            pubkey: vec![1, 2, 3, 4],
+        }));
+    }
+
+    #[test]
+    fn m2_response_frames_round_trip() {
+        assert_round_trips(&ProtocolMessage::ListChannels);
+        assert_round_trips(&ProtocolMessage::ChannelList {
+            channels: vec![ChannelInfo {
+                name: "ops".to_owned(),
+                visibility: Visibility::Private,
+                member: true,
+            }],
+        });
+        assert_round_trips(&ProtocolMessage::Joined { channel: "ops".to_owned() });
+        assert_round_trips(&ProtocolMessage::Ack { detail: Some("ops".to_owned()) });
+        assert_round_trips(&ProtocolMessage::InviteToken { token: "tok-abc".to_owned() });
+        assert_round_trips(&ProtocolMessage::Ping);
+        assert_round_trips(&ProtocolMessage::Pong);
+    }
+
+    #[test]
+    fn appending_variants_preserves_existing_wire_indices() {
+        // The forward-compat guarantee (§13): an old variant's encoding must be byte-identical
+        // after new variants are appended. `Hello` is the first variant (index 0) and must still
+        // start with a 0 discriminant byte.
+        let hello = ProtocolMessage::Hello {
+            protocol_version: Constant::PROTOCOL_VERSION,
+            session: "razel".to_owned(),
+        };
+        assert_eq!(encode(&hello).unwrap()[0], 0, "the first variant's discriminant must remain 0");
     }
 
     #[test]

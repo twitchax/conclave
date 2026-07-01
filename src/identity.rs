@@ -166,7 +166,21 @@ pub fn generate_challenge() -> Res<[u8; Constant::CHALLENGE_SIZE]> {
     Ok(nonce)
 }
 
-fn encode_key(bytes: &[u8]) -> String {
+/// Mints a fresh, opaque invite token: 24 bytes of OS entropy, URL-safe base64 (DESIGN.md §6).
+///
+/// # Errors
+///
+/// Returns an error if the OS random source cannot be read.
+pub fn generate_token() -> Res<String> {
+    let mut bytes = [0_u8; 24];
+    SystemRandom::new().fill(&mut bytes).map_err(|_| anyhow::anyhow!("failed to gather entropy"))?;
+    Ok(encode_key(&bytes))
+}
+
+/// Encodes raw key bytes as a URL-safe base64 string — the canonical on-wire / on-disk key
+/// encoding, symmetric with [`decode_key`]. The server stores machine public keys this way.
+#[must_use]
+pub fn encode_key(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -405,6 +419,16 @@ mod tests {
     #[test]
     fn challenges_are_random() {
         assert_ne!(generate_challenge().unwrap(), generate_challenge().unwrap());
+    }
+
+    #[test]
+    fn invite_tokens_are_random_and_url_safe() {
+        let a = generate_token().unwrap();
+        let b = generate_token().unwrap();
+        assert_ne!(a, b);
+        assert!(!a.is_empty());
+        // URL-safe base64 (no `+`, `/`, or `=` padding).
+        assert!(a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'), "token is not URL-safe: {a}");
     }
 
     #[test]

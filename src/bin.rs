@@ -26,21 +26,31 @@ async fn main() {
         .with_max_level(level)
         .init();
 
-    if let Err(err) = execute(&cli.command) {
+    if let Err(err) = execute(&cli.command).await {
         error!("❌ {err:#}");
         std::process::exit(1);
     }
 }
 
-/// Dispatch a parsed command. In M0 the surface exists but the verbs do not, so this reports
-/// the command as unimplemented rather than silently succeeding.
+/// Dispatch a parsed command into `conclavelib`. `serve` (M2) runs the central server; the
+/// remaining verbs land in M3–M5 and for now report themselves unimplemented rather than
+/// silently succeeding.
 ///
 /// # Errors
 ///
-/// Always returns an error in M0 (the requested command is not yet implemented). From M1 on,
-/// each arm routes into `conclavelib` and surfaces that subsystem's errors.
-fn execute(command: &Command) -> Void {
-    anyhow::bail!("`conclave {}` is not yet implemented (M0 scaffold — see .prds/)", command.verb());
+/// Returns the subsystem's error for an implemented verb, or an "unimplemented" error otherwise.
+async fn execute(command: &Command) -> Void {
+    match command {
+        Command::Serve(args) => {
+            let config = conclavelib::server::ServerConfig {
+                bind: args.bind.clone(),
+                data_dir: args.data_dir.clone(),
+                admins: args.admins.iter().cloned().collect(),
+            };
+            conclavelib::server::serve(config).await
+        }
+        other => anyhow::bail!("`conclave {}` is not yet implemented (see .prds/)", other.verb()),
+    }
 }
 
 /// Discord-for-agents: shared channels that let Claude Code sessions talk to each other.
@@ -132,9 +142,12 @@ struct ServeArgs {
     /// Address to bind the WSS endpoint to.
     #[arg(long, default_value = "0.0.0.0:4390")]
     bind: String,
-    /// Directory for the embedded database and server state.
+    /// Directory for the embedded database and server state (in-memory if omitted).
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Username granted server-wide admin (repeatable); the serve-config allowlist (DESIGN.md §7).
+    #[arg(long = "admin")]
+    admins: Vec<String>,
 }
 
 #[derive(Args, Debug)]

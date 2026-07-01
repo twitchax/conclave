@@ -26,12 +26,19 @@ path = "src/bin.rs"
 # them — see .prds/PRD-0003..0006 and DESIGN.md §21.
 [dependencies]
 anyhow = "1"
+# The central server's WSS endpoint (M2): axum's WebSocket upgrade over a plain-HTTP origin —
+# TLS terminates at cloudflared (DESIGN.md §11/§12), so no rustls here. `default-features = false`
+# keeps it to the WS server essentials.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "ws"] }
 base64 = "0.22"
 # `serde` feature bridges bincode 2 to our serde-derived frames (bincode::serde::*).
 bincode = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+# `Stream`/`Sink` combinators to split the axum WebSocket into independent read/write halves so a
+# session can be fanned-out to while it is still reading (M2 session driver).
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink", "async-await"] }
 # Ed25519 (and the ECDH / AEAD / HKDF primitives v2 E2E will need) via `ring` — one
 # audited crypto dependency. `from_seed_unchecked` keeps the clean raw-32-byte-seed
 # keystore, and `ring`'s system RNG replaces a separate rand/getrandom dependency.
@@ -42,7 +49,9 @@ serde = { version = "1", features = ["derive"] }
 # backend (clean cross-compile); kv-mem backs hermetic tests. DESIGN.md §15.
 surrealdb = { version = "3", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
 thiserror = "2"
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util"] }
+# M2 adds `sync` (mpsc/Mutex fan-out channels), `time` (heartbeat reaper + timeouts), `net`
+# (axum's TCP listener), and `signal` (graceful serve shutdown) to the M1 baseline.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net", "signal"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
@@ -50,6 +59,12 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+# `test-util` (paused clock: `start_paused`, `advance`) drives the deterministic heartbeat-reaper
+# tests; dev-only so production builds never pull it in.
+tokio = { version = "1", features = ["test-util"] }
+# A real WebSocket client for the M2 end-to-end test that drives the spawned `conclave serve`
+# binary over the wire; independent of axum's internal tungstenite (separate process boundary).
+tokio-tungstenite = "0.29"
 
 # Lints live in the Cargo `[lints]` table so they apply DRY across lib + bin
 # (DESIGN.md §22). Groups run at priority -1 so specific lints can override them,

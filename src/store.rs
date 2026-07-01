@@ -122,6 +122,31 @@ struct ByUserAndName {
     name: String,
 }
 
+#[derive(SurrealValue)]
+struct SetAcl {
+    name: String,
+    acl: Vec<String>,
+}
+
+#[derive(SurrealValue)]
+struct SetVisibility {
+    name: String,
+    visibility: String,
+}
+
+#[derive(SurrealValue)]
+struct Rename {
+    old: String,
+    new: String,
+}
+
+#[derive(SurrealValue)]
+struct SetUses {
+    // `token` is a protected variable name in SurrealQL, so bind under `tok`.
+    tok: String,
+    uses: i64,
+}
+
 /// The embedded store: a thin typed repository over an embedded `SurrealDB` instance.
 pub struct Store {
     db: Surreal<Db>,
@@ -321,6 +346,144 @@ impl Store {
         let rows: Vec<InviteRecord> = response.take(0).context("failed to decode invite rows")?;
         Ok(rows.into_iter().next())
     }
+
+    /// Lists every channel; the caller applies visibility / membership gating (DESIGN.md §6).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_channels(&self) -> Res<Vec<ChannelRecord>> {
+        let mut response = self.db.query("SELECT * OMIT id FROM channel").await.context("failed to list channels")?;
+        response.take(0).context("failed to decode channel rows")
+    }
+
+    /// Replaces a channel's access-control list (e.g. after an ACL add / invite redeem).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub async fn set_channel_acl(&self, name: &str, acl: &[String]) -> Void {
+        self.db
+            .query("UPDATE channel SET acl = $acl WHERE name = $name")
+            .bind(SetAcl { name: name.to_owned(), acl: acl.to_vec() })
+            .await
+            .context("failed to update channel acl")?
+            .check()
+            .context("channel acl update reported an error")?;
+        Ok(())
+    }
+
+    /// Changes a channel's visibility tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub async fn set_channel_visibility(&self, name: &str, visibility: Visibility) -> Void {
+        self.db
+            .query("UPDATE channel SET visibility = $visibility WHERE name = $name")
+            .bind(SetVisibility {
+                name: name.to_owned(),
+                visibility: visibility.as_str().to_owned(),
+            })
+            .await
+            .context("failed to update channel visibility")?
+            .check()
+            .context("channel visibility update reported an error")?;
+        Ok(())
+    }
+
+    /// Renames a channel, enforcing the unique-name constraint on the new name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the new name is already taken or the update fails.
+    pub async fn rename_channel(&self, old: &str, new: &str) -> Void {
+        self.db
+            .query("UPDATE channel SET name = $new WHERE name = $old")
+            .bind(Rename { old: old.to_owned(), new: new.to_owned() })
+            .await
+            .context("failed to rename channel")?
+            .check()
+            .context("channel rename reported an error")?;
+        Ok(())
+    }
+
+    /// Deletes a channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn delete_channel(&self, name: &str) -> Void {
+        self.db
+            .query("DELETE channel WHERE name = $name")
+            .bind(ByName { name: name.to_owned() })
+            .await
+            .context("failed to delete channel")?
+            .check()
+            .context("channel delete reported an error")?;
+        Ok(())
+    }
+
+    /// Sets an invite's remaining redemptions (used when redeeming a limited-use token).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub async fn set_invite_uses(&self, token: &str, uses_remaining: i64) -> Void {
+        self.db
+            .query("UPDATE invite SET uses_remaining = $uses WHERE token = $tok")
+            .bind(SetUses {
+                tok: token.to_owned(),
+                uses: uses_remaining,
+            })
+            .await
+            .context("failed to update invite uses")?
+            .check()
+            .context("invite uses update reported an error")?;
+        Ok(())
+    }
+
+    /// Deletes an invite token (on revoke or when an exhausted token is redeemed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn delete_invite(&self, token: &str) -> Void {
+        self.db
+            .query("DELETE invite WHERE token = $tok")
+            .bind(ByToken { tok: token.to_owned() })
+            .await
+            .context("failed to delete invite")?
+            .check()
+            .context("invite delete reported an error")?;
+        Ok(())
+    }
+
+    /// Lists every registered user (server-admin `user list`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_users(&self) -> Res<Vec<UserRecord>> {
+        let mut response = self.db.query("SELECT * OMIT id FROM user").await.context("failed to list users")?;
+        response.take(0).context("failed to decode user rows")
+    }
+
+    /// Deletes a user (server-admin `user remove`); the caller also revokes the user's machines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn delete_user(&self, username: &str) -> Void {
+        self.db
+            .query("DELETE user WHERE username = $username")
+            .bind(ByUsername { username: username.to_owned() })
+            .await
+            .context("failed to delete user")?
+            .check()
+            .context("user delete reported an error")?;
+        Ok(())
+    }
 }
 
 fn now_rfc3339() -> String {
@@ -407,5 +570,79 @@ mod tests {
 
         assert_eq!(store.get_invite("tok-123").await.unwrap(), Some(created));
         assert!(store.create_invite("ops", "tok-123", None, None, "aaron").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_acl_can_be_replaced() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+
+        store.set_channel_acl("ops", &["aaron".to_owned(), "david".to_owned()]).await.unwrap();
+
+        assert_eq!(store.get_channel("ops").await.unwrap().unwrap().acl, vec!["aaron".to_owned(), "david".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn channel_visibility_can_be_changed() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+
+        store.set_channel_visibility("ops", Visibility::Public).await.unwrap();
+
+        assert_eq!(store.get_channel("ops").await.unwrap().unwrap().visibility, "public");
+    }
+
+    #[tokio::test]
+    async fn channel_rename_moves_the_record_and_respects_uniqueness() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        store.create_channel("taken", Visibility::Public, "aaron").await.unwrap();
+
+        store.rename_channel("ops", "operations").await.unwrap();
+        assert!(store.get_channel("ops").await.unwrap().is_none());
+        assert!(store.get_channel("operations").await.unwrap().is_some());
+
+        // Renaming onto an existing name is rejected by the unique index.
+        assert!(store.rename_channel("operations", "taken").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_can_be_deleted_and_listed() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        store.create_channel("lobby", Visibility::Public, "aaron").await.unwrap();
+
+        assert_eq!(store.list_channels().await.unwrap().len(), 2);
+
+        store.delete_channel("ops").await.unwrap();
+        let remaining = store.list_channels().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "lobby");
+    }
+
+    #[tokio::test]
+    async fn invite_uses_can_be_decremented_and_revoked() {
+        let store = store().await;
+        store.create_invite("ops", "tok-123", Some(5), None, "aaron").await.unwrap();
+
+        store.set_invite_uses("tok-123", 4).await.unwrap();
+        assert_eq!(store.get_invite("tok-123").await.unwrap().unwrap().uses_remaining, Some(4));
+
+        store.delete_invite("tok-123").await.unwrap();
+        assert!(store.get_invite("tok-123").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn users_can_be_listed_and_deleted() {
+        let store = store().await;
+        store.create_user("aaron").await.unwrap();
+        store.create_user("david").await.unwrap();
+
+        assert_eq!(store.list_users().await.unwrap().len(), 2);
+
+        store.delete_user("david").await.unwrap();
+        let remaining = store.list_users().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].username, "aaron");
     }
 }
