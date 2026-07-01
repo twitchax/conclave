@@ -10,7 +10,8 @@
 //! - [`base`] — constants, error aliases, and core domain types.
 //! - [`protocol`] — the wire frames shared between bridge and central.
 //! - [`identity`] — the local keystore, signing, and permission config.
-//! - [`server`] — the central `serve` endpoint, store, presence, and fan-out.
+//! - [`server`] — the central `serve` endpoint, presence, and fan-out.
+//! - [`store`] — the embedded `SurrealDB` schema and thin repository.
 //! - [`bridge`] — the MCP stdio peer and multi-server WS client.
 
 pub mod base;
@@ -18,5 +19,6 @@ pub mod bridge;
 pub mod identity;
 pub mod protocol;
 pub mod server;
+pub mod store;
 
 pub mod tests;

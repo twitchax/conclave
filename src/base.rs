@@ -6,7 +6,9 @@
 //! DESIGN.md §5, §6, and §9. Wire-crossing boundary errors (`ProtocolError`,
 //! `AuthError`, `AclError`) live in their respective modules, not here.
 
-use std::fmt;
+use std::{fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
 
 /// A helper type for errors.
 pub type Err = anyhow::Error;
@@ -19,9 +21,14 @@ pub type Void = Res<()>;
 pub struct Constant;
 
 impl Constant {
+    /// Size in bytes of a server-issued authentication challenge nonce (DESIGN.md §5).
+    pub const CHALLENGE_SIZE: usize = 32;
     /// Name of the per-user configuration / keystore directory under the OS config
     /// dir (i.e. `~/.config/conclave`), where identity and permission state live.
     pub const CONFIG_DIR_NAME: &'static str = "conclave";
+    /// Upper bound on a single decoded wire frame (16 MiB), rejecting a bogus length
+    /// prefix before it can drive a large allocation.
+    pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
     /// The wire protocol version negotiated at connect time. Peers advertising an
     /// incompatible version are rejected or upgraded (DESIGN.md §13).
     pub const PROTOCOL_VERSION: u32 = 1;
@@ -34,7 +41,8 @@ impl Constant {
 /// This is a **local** autonomy policy, never sent to the server. Variants are
 /// ordered by ascending autonomy, so a resolved level can be compared against a
 /// threshold (e.g. "below [`PermissionLevel::Converse`] rejects outbound emit").
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PermissionLevel {
     /// Delivery is suppressed entirely; the message is dropped on your side (lurk).
     Mute,
@@ -59,7 +67,8 @@ impl PermissionLevel {
 }
 
 /// A channel's discovery / join visibility tier, stored on the channel record (DESIGN.md §6).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Visibility {
     /// Appears in discovery; anyone on the server may join.
     Public,
@@ -69,12 +78,42 @@ pub enum Visibility {
     Private,
 }
 
+impl Visibility {
+    /// The lowercase wire / storage token for this tier (`public` / `unlisted` / `private`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Unlisted => "unlisted",
+            Self::Private => "private",
+        }
+    }
+}
+
+/// The error returned when a visibility string is not a known tier.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown visibility tier `{0}` (expected public, unlisted, or private)")]
+pub struct ParseVisibilityError(pub String);
+
+impl FromStr for Visibility {
+    type Err = ParseVisibilityError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "public" => Ok(Self::Public),
+            "unlisted" => Ok(Self::Unlisted),
+            "private" => Ok(Self::Private),
+            other => Err(ParseVisibilityError(other.to_owned())),
+        }
+    }
+}
+
 /// A fully-qualified live participant path, `{user}/{machine}/{session}` (DESIGN.md §5).
 ///
 /// Every message's sender is a full path, so a reply or whisper target is always
 /// unambiguous. The `server` component that disambiguates a multi-homed session
 /// (DESIGN.md §8) is carried alongside a path, not embedded in it.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct SessionPath {
     /// The account name (unique per server).
     pub user: String,
@@ -103,8 +142,36 @@ impl fmt::Display for SessionPath {
     }
 }
 
+/// The error returned when a [`SessionPath`] string is malformed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ParsePathError {
+    /// The string was not exactly three `/`-separated, non-empty components.
+    #[error("session path must be `user/machine/session`, got `{0}`")]
+    Malformed(String),
+}
+
+impl FromStr for SessionPath {
+    type Err = ParsePathError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.split(Constant::SESSION_PATH_SEPARATOR);
+        let (Some(user), Some(machine), Some(session), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+            return Err(ParsePathError::Malformed(s.to_owned()));
+        };
+
+        if user.is_empty() || machine.is_empty() || session.is_empty() {
+            return Err(ParsePathError::Malformed(s.to_owned()));
+        }
+
+        Ok(Self::new(user, machine, session))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // Tests relax `unwrap_used` (house convention; DESIGN.md §22).
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use pretty_assertions::assert_eq;
 
@@ -132,5 +199,32 @@ mod tests {
     fn session_path_displays_as_slash_separated_triple() {
         let path = SessionPath::new("aaron", "workstation", "razel");
         assert_eq!(path.to_string(), "aaron/workstation/razel");
+    }
+
+    #[test]
+    fn session_path_parses_a_slash_separated_triple() {
+        let path: SessionPath = "aaron/workstation/razel".parse().unwrap();
+        assert_eq!(path, SessionPath::new("aaron", "workstation", "razel"));
+    }
+
+    #[test]
+    fn session_path_round_trips_through_display_and_parse() {
+        let path = SessionPath::new("aaron", "sno-box", "dotagent");
+        assert_eq!(path.to_string().parse::<SessionPath>().unwrap(), path);
+    }
+
+    #[test]
+    fn session_path_rejects_malformed_strings() {
+        for bad in ["", "a", "a/b", "a/b/c/d", "a//c", "/b/c", "a/b/"] {
+            assert!(bad.parse::<SessionPath>().is_err(), "expected `{bad}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn visibility_round_trips_through_its_wire_token() {
+        for tier in [Visibility::Public, Visibility::Unlisted, Visibility::Private] {
+            assert_eq!(tier.as_str().parse::<Visibility>().unwrap(), tier);
+        }
+        assert!("bogus".parse::<Visibility>().is_err());
     }
 }

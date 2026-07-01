@@ -21,14 +21,30 @@ path = "src/lib.rs"
 name = "conclave"
 path = "src/bin.rs"
 
-# Baseline framework deps only. Feature-specific crates (serde/bincode/ed25519/
-# secrecy/surrealdb/axum/tungstenite/rustls) land in the milestone that first
-# needs them — see .prds/PRD-0002..0006 and DESIGN.md §21.
+# Framework deps + the M1 substrate (wire protocol, identity, embedded store).
+# Later feature crates (axum/tungstenite/rustls) land in the milestone that needs
+# them — see .prds/PRD-0003..0006 and DESIGN.md §21.
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
+# `serde` feature bridges bincode 2 to our serde-derived frames (bincode::serde::*).
+bincode = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+dirs = "6"
+# Ed25519 via ed25519-dalek (not ring): clean raw-seed round-trip for the on-disk
+# keystore and easy `secrecy`-wrapping of the 32-byte seed. Keygen uses `getrandom`
+# directly (rand 0.10 is incompatible with dalek's rand_core 0.6).
+ed25519-dalek = "2"
+getrandom = "0.2"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+# Embedded SurrealDB via the bare SDK (no ORM). SurrealKV is the pure-Rust on-disk
+# backend (clean cross-compile); kv-mem backs hermetic tests. DESIGN.md §15.
+surrealdb = { version = "3", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
 thiserror = "2"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util"] }
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
 
