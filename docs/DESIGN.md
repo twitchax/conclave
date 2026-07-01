@@ -334,8 +334,8 @@ message history (none); **permission levels** (local bridge config, §9); **serv
 - **M0** — **project scaffolding & hygiene** (§22): repo skeleton with the lib+bin SOC stubs, lints
   + profiles + `rustfmt.toml`, `cargo-make` (`ci` gate), CI (lint/test/codecov/platform +
   `copilot-setup-steps`), `.config/nextest.toml`, the unit/integration/e2e harness skeleton with
-  fixtures + helpers, README/CHANGELOG/DEVELOPMENT/CLAUDE.md, and `.prds/`. Quality is the substrate,
-  not a retrofit. (Includes the stable-vs-nightly toolchain decision.)
+  fixtures + helpers, README/CHANGELOG/DEVELOPMENT/CLAUDE.md, MIT `LICENSE`, and `.prds/`.
+  Pinned-nightly toolchain, edition 2024. Quality is the substrate, not a retrofit.
 - **M1** — wire types (with the E2E-ready envelope reserved) + identity/keystore + embedded
   SurrealDB schema/repo.
 - **M2** — central `serve`: register, machine add/remove + revocation, challenge-response auth +
@@ -393,10 +393,9 @@ newest; a tokio network service) is the closest structural template. This is **M
 the repo with all of this in place *before* feature work, so quality is the substrate, not a
 retrofit. The global Rust constitution (`~/CLAUDE.md`) applies on top.
 
-- **Toolchain & edition.** Pinned via `rust-toolchain.toml`. *Open decision for your pass:* the
-  example repos pin **nightly** (only for `#[coverage(off)]` / a few unstable features); conclave
-  needs none of that, so I recommend **stable Rust, edition 2024** — friendlier for an OSS network
-  project and immune to nightly drift. Flagging because it diverges from the ecosystem's nightly pin.
+- **Toolchain & edition.** **Pinned nightly** via `rust-toolchain.toml` (matching kord/razel/ratrod),
+  **edition 2024**. Ecosystem consistency wins, and it gives `#[coverage(off)]` for clean coverage
+  exclusions. Nothing in the stack actually requires nightly, so dropping to stable later is trivial.
 - **Lints (razel's set — the strongest).** Via the Cargo `[lints]` table (DRY across lib + bin):
   `deny(unused, clippy::unwrap_used, clippy::correctness, clippy::complexity, clippy::pedantic)`,
   with narrow `allow`s only for macro-codegen false positives; tests relax `clippy::unwrap_used`.
@@ -451,7 +450,7 @@ retrofit. The global Rust constitution (`~/CLAUDE.md`) applies on top.
   docs.rs, license) → one-liner → **Usage** (`--help` verbatim) → **Install** → **Protocol**
   (**Mermaid sequence diagrams** of the auth handshake, channel fan-out, whisper, and
   permission-relay — ratrod does this and it fits conclave perfectly) → **Development** (cargo-make
-  cmds) → **Architecture** (module tree) → License. Module `//!` + `///` on every public item
+  cmds) → **Architecture** (module tree) → License (**MIT**). Module `//!` + `///` on every public item
   (doctests double as docs, kord). `DEVELOPMENT.md` contributor guide; `CHANGELOG.md` Keep-a-Changelog
   + SemVer via **git-cliff**; `cargo-release --no-publish` for version bumps, publish as a separate
   manual step. `CLAUDE.md` encodes conclave-specifics; PRDs live in **`.prds/`** (razel) — M1–M5
