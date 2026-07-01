@@ -65,6 +65,32 @@ Flakiness controls for socket/timing-sensitive tests live in
 [`.config/nextest.toml`](.config/nextest.toml): `retries = 2` and a serialized `network-heavy`
 test group. **Every behavioral change ships a test — no exceptions.**
 
+## Bridge ↔ Claude Code (`claude/channel`)
+
+The bridge is an MCP server that injects inbound traffic into Claude Code via the experimental
+`claude/channel` capability (DESIGN.md §4). The wire shape is validated against the installed CC in
+CI with a **mock MCP client** (`test(/bridge_inject/)`) and a two-bridge e2e (`test(/e2e_channel/)`).
+The **live-CC** check is manual and kept out of CI because Claude Code gates the capability behind a
+development-channel flag (a normally-registered MCP server has `claude/channel` stripped):
+
+1. Stand up a server and register + enroll this machine (M4 adds the `register` verb; until then use
+   the e2e's provisioning path as a reference).
+2. Launch Claude Code with the bridge loaded as a **development channel** so the capability survives:
+
+   ```bash
+   claude --dangerously-load-development-channels \
+     'server:conclave=conclave bridge --server wss://your.server --as my-session'
+   ```
+
+   > `--dangerously-load-development-channels` is for local channel development only. The alternative
+   > is the `allowedChannelPlugins` managed-settings allowlist. Without one of these, CC strips
+   > `claude/channel` and no injection occurs.
+3. From another session/machine, send a channel message; confirm it surfaces in the CC session as a
+   `<channel …>` tag, and that `send_channel` / `whisper` replies flow back.
+
+If the capability shape ever drifts, the mock-client tests in `src/bridge/mcp.rs` are the canonical
+record of the expected frames; update them alongside the validation.
+
 ## Milestones & PRDs
 
 Work is planned as PRDs in [`.prds/`](.prds/) (M0 = PRD-0001 … M5 = PRD-0006). Reference the task

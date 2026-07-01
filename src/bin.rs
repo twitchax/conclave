@@ -49,8 +49,37 @@ async fn execute(command: &Command) -> Void {
             };
             conclavelib::server::serve(config).await
         }
+        Command::Bridge(args) => run_bridge(args).await,
         other => anyhow::bail!("`conclave {}` is not yet implemented (see .prds/)", other.verb()),
     }
+}
+
+/// Loads the local identity + config and runs the bridge (MCP stdio peer + WS client).
+///
+/// # Errors
+///
+/// Returns an error if the keystore/config cannot be loaded or no server is configured.
+async fn run_bridge(args: &BridgeArgs) -> Void {
+    use anyhow::Context as _;
+
+    let config_dir = match &args.config_dir {
+        Some(dir) => dir.clone(),
+        None => conclavelib::identity::default_config_dir()?,
+    };
+    let identity = conclavelib::identity::load_identity(&config_dir)?;
+    let config = conclavelib::identity::load_config(&config_dir)?;
+    let session = match &args.session {
+        Some(session) => session.clone(),
+        None => conclavelib::identity::default_handle(&std::env::current_dir().context("failed to read the working directory")?),
+    };
+
+    conclavelib::bridge::run(conclavelib::bridge::BridgeSetup {
+        identity,
+        config,
+        session,
+        servers: args.servers.clone(),
+    })
+    .await
 }
 
 /// Discord-for-agents: shared channels that let Claude Code sessions talk to each other.
@@ -155,6 +184,12 @@ struct BridgeArgs {
     /// Server URL to connect to (repeatable); defaults to the known-servers list.
     #[arg(long = "server")]
     servers: Vec<String>,
+    /// Config / keystore directory (defaults to `~/.config/conclave`).
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    /// Session handle for this connection; defaults to the working-directory name.
+    #[arg(long = "as")]
+    session: Option<String>,
 }
 
 #[derive(Args, Debug)]

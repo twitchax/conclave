@@ -708,6 +708,7 @@ dependencies = [
  "ring",
  "secrecy",
  "serde",
+ "serde_json",
  "surrealdb",
  "tempfile",
  "thiserror",

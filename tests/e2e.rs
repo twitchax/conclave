@@ -11,18 +11,25 @@
 
 use std::{
     net::{SocketAddr, TcpListener},
+    path::Path,
     process::{Child, Command, Stdio},
     time::Duration,
 };
 
 use conclavelib::{
-    base::{Constant, SessionPath},
-    identity::Identity,
-    protocol::{Payload, ProtocolMessage, decode, encode},
+    base::{Constant, PermissionLevel, SessionPath, Visibility},
+    identity::{Config, Identity, ServerRegistration, save_config, save_identity},
+    protocol::{AdminOp, Payload, ProtocolMessage, decode, encode},
 };
 use futures_util::{SinkExt as _, StreamExt as _};
+use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines},
+    net::TcpStream,
+    process::{ChildStdin, ChildStdout},
+    time::timeout,
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 /// Path to the freshly-built `conclave` binary, injected by Cargo at compile time.
@@ -202,4 +209,167 @@ async fn ws_register(ws: &mut Ws, id: &Identity, username: &str, machine: &str, 
 async fn join(ws: &mut Ws, channel: &str) {
     ws_send(ws, &ProtocolMessage::Join { channel: channel.to_owned(), token: None }).await;
     assert!(matches!(ws_recv(ws).await, ProtocolMessage::Joined { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// M3 — serve + two bridge processes; a channel message and a whisper cross the fabric.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_channel_message_and_whisper_between_bridges() {
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let _server = ServerProcess(
+        Command::new(CONCLAVE_BIN)
+            .args(["serve", "--bind", &addr.to_string(), "--data-dir", server_dir.path().to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn `conclave serve`"),
+    );
+    wait_for_listener(addr).await;
+
+    // Provision aaron (creates a public "lobby") and david, each enrolled on the server. Aaron
+    // defaults to `converse` so he may emit to the channel and whisper (its own scope, §9).
+    let aaron_dir = TempDir::new().unwrap();
+    let aaron_id = Identity::generate().unwrap();
+    provision(aaron_dir.path(), &aaron_id, &url, "aaron", "workstation", PermissionLevel::Converse);
+    {
+        let mut ws = ws_connect(addr).await;
+        ws_register(&mut ws, &aaron_id, "aaron", "workstation", "setup").await;
+        ws_send(
+            &mut ws,
+            &ProtocolMessage::Admin(AdminOp::CreateChannel {
+                name: "lobby".to_owned(),
+                visibility: Visibility::Public,
+            }),
+        )
+        .await;
+        assert!(matches!(ws_recv(&mut ws).await, ProtocolMessage::Ack { .. }));
+    }
+
+    let david_dir = TempDir::new().unwrap();
+    let david_id = Identity::generate().unwrap();
+    provision(david_dir.path(), &david_id, &url, "david", "desktop", PermissionLevel::Notify);
+    {
+        let mut ws = ws_connect(addr).await;
+        ws_register(&mut ws, &david_id, "david", "desktop", "setup").await;
+    }
+
+    // Both bridges come up as MCP servers over stdio; the test plays the role of Claude Code.
+    let mut alice = Bridge::spawn(aaron_dir.path(), &url, "alice");
+    let mut david = Bridge::spawn(david_dir.path(), &url, "davidsession");
+    alice.initialize().await;
+    david.initialize().await;
+
+    // Both join lobby; alice's converse default lets her emit, david receives read-only.
+    alice.call(1, "join_channel", json!({ "channel": "lobby" })).await;
+    david.call(1, "join_channel", json!({ "channel": "lobby" })).await;
+
+    // A channel message from alice is injected into david's session as a <channel> tag.
+    alice.call(2, "send_channel", json!({ "channel": "lobby", "text": "hello over the fabric" })).await;
+    let note = david.read_injection("hello over the fabric").await;
+    assert_eq!(note.pointer("/params/meta/channel").and_then(Value::as_str), Some("lobby"));
+    assert!(note.pointer("/params/content").and_then(Value::as_str).unwrap().contains("<channel"));
+
+    // A whisper from alice reaches exactly david's session as a <whisper> tag.
+    alice.call(3, "whisper", json!({ "target": "david/desktop/davidsession", "text": "psst — just you" })).await;
+    let whisper = david.read_injection("psst — just you").await;
+    assert_eq!(whisper.pointer("/params/meta/kind").and_then(Value::as_str), Some("whisper"));
+}
+
+/// Writes a bridge's keystore + `config.toml` (identity, permission default, server registration).
+fn provision(dir: &Path, identity: &Identity, url: &str, username: &str, machine: &str, default_permission: PermissionLevel) {
+    save_identity(dir, identity).unwrap();
+    save_config(
+        dir,
+        &Config {
+            default_permission,
+            servers: vec![ServerRegistration {
+                url: url.to_owned(),
+                username: username.to_owned(),
+                machine: machine.to_owned(),
+            }],
+            overrides: vec![],
+        },
+    )
+    .unwrap();
+}
+
+/// A spawned `conclave bridge` process, driven over MCP stdio as Claude Code would.
+struct Bridge {
+    child: tokio::process::Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+}
+
+impl Bridge {
+    fn spawn(config_dir: &Path, url: &str, session: &str) -> Self {
+        let mut child = tokio::process::Command::new(CONCLAVE_BIN)
+            .args(["bridge", "--config-dir", config_dir.to_str().unwrap(), "--server", url, "--as", session])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn `conclave bridge`");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        Self { child, stdin, stdout }
+    }
+
+    async fn send(&mut self, message: Value) {
+        let mut line = serde_json::to_vec(&message).unwrap();
+        line.push(b'\n');
+        self.stdin.write_all(&line).await.unwrap();
+        self.stdin.flush().await.unwrap();
+    }
+
+    async fn read_matching<F: Fn(&Value) -> bool>(&mut self, predicate: F) -> Value {
+        loop {
+            let line = timeout(Duration::from_secs(15), self.stdout.next_line())
+                .await
+                .expect("timed out waiting on bridge stdout")
+                .expect("error reading bridge stdout")
+                .expect("bridge stdout closed unexpectedly");
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && predicate(&value)
+            {
+                return value;
+            }
+        }
+    }
+
+    async fn initialize(&mut self) {
+        self.send(json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "e2e", "version": "0" } }
+        }))
+        .await;
+        let result = self.read_matching(|v| v.get("id") == Some(&json!(0)) && v.get("result").is_some()).await;
+        assert!(
+            result.pointer("/result/capabilities/experimental").and_then(|e| e.get("claude/channel")).is_some(),
+            "bridge must declare the claude/channel capability: {result}"
+        );
+        self.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+    }
+
+    async fn call(&mut self, id: i64, name: &str, arguments: Value) -> Value {
+        self.send(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
+            .await;
+        self.read_matching(|v| v.get("id") == Some(&json!(id))).await
+    }
+
+    async fn read_injection(&mut self, needle: &str) -> Value {
+        let needle = needle.to_owned();
+        self.read_matching(move |v| v.get("method") == Some(&json!("notifications/claude/channel")) && v.pointer("/params/content").and_then(Value::as_str).is_some_and(|c| c.contains(&needle)))
+            .await
+    }
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
 }

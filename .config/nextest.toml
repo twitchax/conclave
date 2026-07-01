@@ -15,8 +15,8 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # assigned via per-test overrides as those tests arrive.
 network-heavy = { max-threads = 1 }
 
-# The `e2e_serve_*` tests spawn a real `conclave serve` on a loopback port; serialize them so
-# concurrent binds don't race for ports.
+# The `e2e_serve_*` / `e2e_channel_*` tests spawn a real `conclave serve` (and bridges) on loopback
+# ports; serialize them so concurrent binds don't race for ports.
 [[profile.default.overrides]]
-filter = 'test(/e2e_serve/)'
+filter = 'test(/e2e_(serve|channel)/)'
 test-group = 'network-heavy'

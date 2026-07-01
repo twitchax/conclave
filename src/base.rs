@@ -66,6 +66,25 @@ impl PermissionLevel {
     }
 }
 
+/// The error returned when a permission-level string is not a known level.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown permission level `{0}` (expected mute, notify, converse, or act)")]
+pub struct ParsePermissionError(pub String);
+
+impl FromStr for PermissionLevel {
+    type Err = ParsePermissionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mute" => Ok(Self::Mute),
+            "notify" => Ok(Self::Notify),
+            "converse" => Ok(Self::Converse),
+            "act" => Ok(Self::Act),
+            other => Err(ParsePermissionError(other.to_owned())),
+        }
+    }
+}
+
 /// A channel's discovery / join visibility tier, stored on the channel record (DESIGN.md §6).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -193,6 +212,19 @@ mod tests {
         assert!(!PermissionLevel::Notify.may_emit());
         assert!(PermissionLevel::Converse.may_emit());
         assert!(PermissionLevel::Act.may_emit());
+    }
+
+    #[test]
+    fn permission_level_parses_from_its_lowercase_token() {
+        for (token, level) in [
+            ("mute", PermissionLevel::Mute),
+            ("notify", PermissionLevel::Notify),
+            ("converse", PermissionLevel::Converse),
+            ("act", PermissionLevel::Act),
+        ] {
+            assert_eq!(token.parse::<PermissionLevel>().unwrap(), level);
+        }
+        assert!("bogus".parse::<PermissionLevel>().is_err());
     }
 
     #[test]

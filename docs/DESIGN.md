@@ -60,6 +60,23 @@ the session as `<channel …>` / `<whisper …>` tags; the agent replies by call
 exposes. (The prototype proved this works; we validate the exact capability/notification shape
 against the installed Claude Code version while building the bridge in M3 — no separate trial.)
 
+> **M3 validation (Claude Code 2.1.198).** The capability shape is confirmed against the installed
+> binary and unchanged from the prototype. A server is treated as a channel only if it declares
+> **both** `capabilities.experimental["claude/channel"]` and `["claude/channel/permission"]` in its
+> `initialize` reply. Injection is a `notifications/claude/channel` notification with params
+> `{ content: string, meta?: Record<string,string> }`; the permission relay is
+> `notifications/claude/channel/permission_request` (CC→bridge:
+> `{ request_id, tool_name, description, input_preview }`) answered by
+> `notifications/claude/channel/permission` (bridge→CC: `{ request_id, behavior }`).
+>
+> **Activation gate (new constraint).** CC *strips* the `claude/channel` capability from a
+> normally-registered MCP server unless it is loaded as a development channel — launched with
+> `--dangerously-load-development-channels` (local dev) or present in the `allowedChannelPlugins`
+> managed-settings allowlist. So the bridge injects only when CC is started that way; this is an
+> install/packaging concern for the `/join` skill (M4), not a change to the bridge protocol. The
+> bridge is built and unit-tested against a **mock MCP client**; the live-CC check is a documented
+> manual recipe (DEVELOPMENT.md), kept out of CI because the gate makes it environment-dependent.
+
 ## 5. Identity model — `{user}/{machine}/{session}`
 
 Think **"`authorized_keys` for identity":**
