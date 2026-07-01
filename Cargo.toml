@@ -1,0 +1,72 @@
+[package]
+name = "conclave-cli"
+version = "0.1.0"
+edition = "2024"
+resolver = "2"
+authors = ["Aaron Roney <twitchax@gmail.com>"]
+description = "Discord-for-agents: shared channels that let Claude Code sessions talk to each other over a central server."
+license = "MIT"
+repository = "https://github.com/twitchax/conclave"
+readme = "README.md"
+keywords = ["cli", "claude", "mcp", "agents", "chat"]
+categories = ["command-line-utilities"]
+
+# The published crate is `conclave-cli` (the bare `conclave` name is squatted),
+# but the installed binary is still `conclave` (see DESIGN.md §20).
+[lib]
+name = "conclavelib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "conclave"
+path = "src/bin.rs"
+
+# Baseline framework deps only. Feature-specific crates (serde/bincode/ed25519/
+# secrecy/surrealdb/axum/tungstenite/rustls) land in the milestone that first
+# needs them — see .prds/PRD-0002..0006 and DESIGN.md §21.
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+# Lints live in the Cargo `[lints]` table so they apply DRY across lib + bin
+# (DESIGN.md §22). Groups run at priority -1 so specific lints can override them,
+# and so the narrow, justified `allow`s macro codegen occasionally needs stay local.
+[lints.rust]
+unused = { level = "deny", priority = -1 }
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Fast-iterate: release-like codegen without the expensive LTO / single-CGU link.
+[profile.dev-release]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16
+debug = 1
+strip = false
+
+# Backs the Performance constitution's "measure hot paths with criterion":
+# release optimizations, full debug info, no LTO so symbols stay legible.
+[profile.profiling]
+inherits = "release"
+debug = 2
+lto = false
+strip = false

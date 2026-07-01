@@ -1,0 +1,16 @@
+# Rust build output
+/target
+
+# Coverage artifacts
+/coverage.lcov
+/*.profraw
+/target/llvm-cov
+/target/nextest
+
+# Embedded SurrealDB data directory (conclave serve)
+/.surreal
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~

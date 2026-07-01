@@ -1,0 +1,203 @@
+# conclave — cargo-make configuration.
+#
+# cargo-make is the sole entry point for dev commands (DESIGN.md §22). Every task pins
+# `workspace = false` and an explicit `cwd` so behaviour is identical whether invoked from the
+# repo root or a subdirectory. The canonical gate is `ci = [fmt-check, clippy, test]`.
+
+# =============================================================================
+# Tool installation (large executables via `cargo binstall`, never built from source)
+# =============================================================================
+
+[tasks.install-cargo-binstall]
+# In CI this is provided by the cargo-bins/cargo-binstall@main action; locally, install once
+# from https://github.com/cargo-bins/cargo-binstall.
+script = "echo 'Checking cargo-binstall availability...'"
+
+[tasks.install-nextest]
+dependencies = ["install-cargo-binstall"]
+command = "cargo"
+args = ["binstall", "cargo-nextest", "--no-confirm", "--locked"]
+
+[tasks.install-llvm-cov]
+dependencies = ["install-cargo-binstall"]
+command = "cargo"
+args = ["binstall", "cargo-llvm-cov", "--no-confirm", "--locked"]
+
+[tasks.install-cargo-release]
+dependencies = ["install-cargo-binstall"]
+command = "cargo"
+args = ["binstall", "cargo-release", "--no-confirm", "--locked"]
+
+[tasks.install-git-cliff]
+dependencies = ["install-cargo-binstall"]
+command = "cargo"
+args = ["binstall", "git-cliff", "--no-confirm", "--locked"]
+
+[tasks.tools]
+dependencies = ["install-nextest", "install-llvm-cov"]
+
+# =============================================================================
+# Formatting
+# =============================================================================
+
+[tasks.fmt]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["fmt"]
+
+[tasks.fmt-check]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["fmt", "--check"]
+
+# =============================================================================
+# Linting
+# =============================================================================
+
+[tasks.clippy]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
+
+# =============================================================================
+# Build
+# =============================================================================
+
+[tasks.build]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["build"]
+
+[tasks.build-release]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.build-dev-release]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["build", "--profile", "dev-release"]
+
+[tasks.build-profiling]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["build", "--profile", "profiling"]
+
+# =============================================================================
+# Testing
+# =============================================================================
+
+[tasks.test]
+cwd = "."
+workspace = false
+dependencies = ["install-nextest"]
+command = "cargo"
+args = ["nextest", "run"]
+
+[tasks.test-cargo]
+# Fallback for environments without nextest.
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["test"]
+
+# =============================================================================
+# Code coverage
+# =============================================================================
+
+# `clear = true` overrides cargo-make's predefined `codecov` task (which shells out to the
+# legacy codecov bash uploader) with our llvm-cov invocation.
+[tasks.codecov]
+cwd = "."
+workspace = false
+clear = true
+dependencies = ["tools"]
+command = "cargo"
+args = ["llvm-cov", "nextest", "--all-features", "--lcov", "--output-path", "coverage.lcov"]
+
+[tasks.codecov-html]
+cwd = "."
+workspace = false
+clear = true
+dependencies = ["tools"]
+command = "cargo"
+args = ["llvm-cov", "nextest", "--all-features", "--html"]
+
+# =============================================================================
+# CI pipeline
+# =============================================================================
+
+[tasks.ci]
+# The canonical gate, reused verbatim in CI: format check, lint, test.
+workspace = false
+dependencies = ["fmt-check", "clippy", "test"]
+
+[tasks.uat]
+# User-acceptance gate: the CI gate is the M0 UAT surface. Milestone-specific UAT commands
+# defined in .prds/ are appended here as they land.
+workspace = false
+dependencies = ["ci"]
+
+# =============================================================================
+# Platform builds (CI artifact generation)
+# =============================================================================
+
+[tasks.build-linux]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["build", "--target", "x86_64-unknown-linux-gnu", "--release"]
+
+[tasks.build-windows]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["build", "--target", "x86_64-pc-windows-gnu", "--release"]
+
+[tasks.build-macos]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["build", "--target", "aarch64-apple-darwin", "--release"]
+
+# =============================================================================
+# Release hygiene
+# =============================================================================
+
+[tasks.changelog]
+cwd = "."
+workspace = false
+dependencies = ["install-git-cliff"]
+command = "git-cliff"
+args = ["--output", "CHANGELOG.md"]
+
+[tasks.release-bump]
+# Version bump + tag only; publishing is a separate, manual step.
+cwd = "."
+workspace = false
+dependencies = ["install-cargo-release"]
+command = "cargo"
+args = ["release", "--no-publish", "--execute"]
+
+# =============================================================================
+# Development helpers
+# =============================================================================
+
+[tasks.run]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["run", "--", "${@}"]
+
+[tasks.clean]
+cwd = "."
+workspace = false
+command = "cargo"
+args = ["clean"]

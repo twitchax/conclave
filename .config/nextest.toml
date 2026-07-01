@@ -1,0 +1,16 @@
+# Nextest configuration. Overrides (per-test timeouts, group assignments) are added as the
+# network / socket-bound tests land in M1+ — see razel's .config/nextest.toml for the pattern.
+
+[profile.default]
+# Socket / timing-sensitive suites are inherently a little flaky; a couple of retries keep a
+# transient blip from reddening an otherwise-green run.
+retries = 2
+# Default per-test ceiling. A test still running after several slow-timeout periods is treated
+# as hung and terminated.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[test-groups]
+# Live-network / socket-bound e2e tests oversubscribe a small CI runner when they land on the
+# suite tail together. Serialize them (they still overlap ordinary cheap tests); membership is
+# assigned via per-test overrides as those tests arrive.
+network-heavy = { max-threads = 1 }
