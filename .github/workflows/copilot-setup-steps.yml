@@ -1,0 +1,43 @@
+name: "Copilot Setup Steps"
+
+# Bootstraps the coding-agent environment. Validated via PRs and manually from the Actions tab.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  # Copilot requires this exact job name.
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # Keep in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-12-22
+          components: rustfmt, clippy
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      # rust-cache should run AFTER toolchain selection (it keys off the rustc version).
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
+
+      - name: Install cargo tools
+        run: cargo binstall cargo-make cargo-nextest cargo-llvm-cov --no-confirm
+
+      - name: Prefetch deps
+        run: cargo fetch

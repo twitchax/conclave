@@ -1,0 +1,128 @@
+on: [push]
+
+name: Build and Test
+
+# Keep in sync with rust-toolchain.toml (the pinned nightly is the single source of truth for
+# local builds; this mirrors it for the CI toolchain install so rust-cache keys correctly).
+env:
+    RUST_TOOLCHAIN: nightly-2025-12-22
+
+jobs:
+    # Lint runs in parallel with test rather than serializing fmt + clippy ahead of it.
+    lint:
+        name: Lint (fmt + clippy)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: ${{ env.RUST_TOOLCHAIN }}
+                  components: rustfmt, clippy
+            - uses: cargo-bins/cargo-binstall@main
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  cache-all-crates: "true"
+            - run: cargo binstall cargo-make --no-confirm
+            - run: cargo make fmt-check
+            - run: cargo make clippy
+
+    test:
+        name: Test
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: ${{ env.RUST_TOOLCHAIN }}
+            - uses: cargo-bins/cargo-binstall@main
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  cache-all-crates: "true"
+            - run: cargo binstall cargo-make --no-confirm
+            - run: cargo make test
+
+    codecov:
+        needs: test
+        name: Code Coverage
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: ${{ env.RUST_TOOLCHAIN }}
+            - uses: cargo-bins/cargo-binstall@main
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  cache-all-crates: "true"
+            - run: cargo binstall cargo-make --no-confirm
+            - run: cargo make codecov
+            - uses: codecov/codecov-action@v5
+              with:
+                  token: ${{ secrets.CODECOV_TOKEN }}
+                  slug: twitchax/conclave
+
+    build_linux:
+        needs: test
+        name: Build Linux
+        runs-on: ubuntu-latest
+        if: github.ref == 'refs/heads/main'
+        steps:
+            - uses: actions/checkout@v5
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: ${{ env.RUST_TOOLCHAIN }}
+                  targets: x86_64-unknown-linux-gnu
+            - uses: cargo-bins/cargo-binstall@main
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  cache-all-crates: "true"
+            - run: cargo binstall cargo-make --no-confirm
+            - run: cargo make build-linux
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: conclave_x86_64-unknown-linux-gnu
+                  path: target/x86_64-unknown-linux-gnu/release/conclave
+
+    build_windows:
+        needs: test
+        name: Build Windows
+        runs-on: ubuntu-latest
+        if: github.ref == 'refs/heads/main'
+        steps:
+            - uses: actions/checkout@v5
+            - name: Install mingw-w64
+              run: sudo apt-get install -y mingw-w64
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: ${{ env.RUST_TOOLCHAIN }}
+                  targets: x86_64-pc-windows-gnu
+            - uses: cargo-bins/cargo-binstall@main
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  cache-all-crates: "true"
+            - run: cargo binstall cross --no-confirm
+            - run: cross build --target x86_64-pc-windows-gnu --release
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: conclave_x86_64-pc-windows-gnu
+                  path: target/x86_64-pc-windows-gnu/release/conclave.exe
+
+    build_macos:
+        needs: test
+        name: Build MacOS
+        runs-on: macos-15
+        if: github.ref == 'refs/heads/main'
+        steps:
+            - uses: actions/checkout@v5
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: ${{ env.RUST_TOOLCHAIN }}
+                  targets: aarch64-apple-darwin
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  cache-all-crates: "true"
+            - run: cargo build --target aarch64-apple-darwin --release
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: conclave_aarch64-apple-darwin
+                  path: target/aarch64-apple-darwin/release/conclave
