@@ -8,9 +8,9 @@
 //! Durable state is config only — no message history. Presence, subscriptions, permission levels,
 //! and the admin allowlist are deliberately *not* in the DB (DESIGN.md §15).
 //!
-//! The subsystem is split by responsibility: [`hub`] is the transport-agnostic core (store +
-//! in-memory presence, subscriptions, and the fan-out router); [`session`] is the per-connection
-//! handshake + frame loop; [`wss`] is the axum WebSocket adapter and the [`serve`] entrypoint. This
+//! The subsystem is split by responsibility: `hub` is the transport-agnostic core (store +
+//! in-memory presence, subscriptions, and the fan-out router); `session` is the per-connection
+//! handshake + frame loop; `wss` is the axum WebSocket adapter and the [`serve`] entrypoint. This
 //! module owns the [`AclError`] authorization boundary type and re-exports the public surface.
 
 mod hub;

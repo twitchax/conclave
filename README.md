@@ -17,9 +17,10 @@ and your agent replies by calling tools the bridge exposes. Identity is SSH-styl
 Ed25519 key, `authorized_keys`-for-identity — and how much an inbound message may drive your agent
 is a local autonomy policy you control.
 
-> **Status:** early construction. M0 (the project scaffold) is in place; the wire protocol,
-> identity, server, and bridge land across M1–M5. See [`docs/DESIGN.md`](docs/DESIGN.md) for the
-> full design and [`.prds/`](.prds/) for the milestone plan.
+> **Status:** v1 complete (M0–M5): wire protocol, identity/keystore, central server, bridge,
+> the full control/admin CLI, the packaged Claude Code skill, and hardening (invites, visibility,
+> live permissions, multi-home). E2E encryption and the rest of §19 are v2+. See
+> [`docs/DESIGN.md`](docs/DESIGN.md) for the full design and [`.prds/`](.prds/) for the milestones.
 
 ## Usage
 
@@ -43,13 +44,17 @@ Commands:
   kick      Kick a live session or user from a channel
   ban       Ban a user from a channel
   user      Server-admin user management: list, remove
+  skill     Print or install the packaged Claude Code skill (the whole-CLI guide)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-  -v, --verbose  Increase logging verbosity to debug level
-  -h, --help     Print help
-  -V, --version  Print version
+      --config-dir <CONFIG_DIR>  Config / keystore directory (defaults to `~/.config/conclave`)
+  -v, --verbose                  Increase logging verbosity to debug level
+  -h, --help                     Print help
+  -V, --version                  Print version
 ```
+
+> The exhaustive per-verb reference is generated into the packaged skill — run `conclave skill`.
 
 ## Install
 
@@ -153,8 +158,11 @@ conclavelib
 ├── base       constants, error aliases (Err/Res/Void), core domain types
 ├── protocol   wire frames shared between bridge and central (E2E-ready envelope)
 ├── identity   local keystore, signing, per-server registrations, permission config
-├── server     central `serve`: WSS endpoint, SurrealDB store, presence, fan-out
-└── bridge     MCP stdio peer + multi-server WS client, permission policy
+├── store      embedded SurrealDB schema + thin per-table repository
+├── server     central `serve`: WSS endpoint, presence, fan-out, admin authorization
+├── bridge     MCP stdio peer + multi-server WS client, permission policy, gated tools
+├── control    one-shot WS control client backing the CLI verbs
+└── skill      the packaged Claude Code skill emitted by `conclave skill`
 ```
 
 ## License

@@ -9,10 +9,10 @@
 //! notification sink; and it rejects outbound emit calls whose target channel is below
 //! `converse`.
 //!
-//! Split by responsibility: [`policy`] resolves the local autonomy level and gates emit;
-//! [`sink`] frames a delivered message and pushes it to the session; [`mcp`] is the JSON-RPC
-//! stdio peer toward Claude Code; [`client`] holds the outbound WS connections to central with
-//! reconnect + re-subscribe. [`BridgeCore`] is the transport-free dispatcher those feed.
+//! Split by responsibility: `policy` resolves the local autonomy level and gates emit;
+//! `sink` frames a delivered message and pushes it to the session; `mcp` is the JSON-RPC
+//! stdio peer toward Claude Code; `client` holds the outbound WS connections to central with
+//! reconnect + re-subscribe. `BridgeCore` is the transport-free dispatcher those feed.
 
 mod client;
 mod mcp;
