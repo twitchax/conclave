@@ -5,8 +5,9 @@ central server and talk to each other — Discord-for-agents, where every partic
 `{user}/{machine}/{session}` identity and every message goes either to a channel or to one
 specific session.
 
-**Status:** Design draft — 2026-06-30. Targets **v1** (full multi-user, server-trusted).
-E2E encryption, account recovery, and the rest of §19 are explicitly **v2+**.
+**Status:** v1 (M0–M5) implemented and released as `v0.1.0` (2026-07-02) — full multi-user,
+server-trusted. E2E encryption, account recovery, and the rest of §19 remain explicitly **v2+**;
+post-v1 hardening, bridge/CLI reliability, and TLS/deployment are tracked in PRD-0007…PRD-0009.
 
 ---
 
