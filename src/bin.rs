@@ -7,7 +7,10 @@
 
 #![feature(coverage_attribute)]
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::IsTerminal as _,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context as _;
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
@@ -25,18 +28,29 @@ use tracing::error;
 async fn main() {
     let cli = Cli::parse();
 
-    let level = if cli.verbose { tracing::Level::DEBUG } else { tracing::Level::INFO };
+    let directive = log_directive(cli.verbose, std::env::var("RUST_LOG").ok().as_deref());
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_ansi(true)
+        // Colors only on a real terminal, so piped output / container logs stay clean (T-005).
+        .with_ansi(std::io::stderr().is_terminal())
         .with_level(true)
         .with_target(false)
-        .with_max_level(level)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(directive))
         .init();
 
     if let Err(err) = execute(&cli).await {
         error!("❌ {err:#}");
         std::process::exit(1);
+    }
+}
+
+/// The tracing filter directive: `RUST_LOG` if set and non-empty, else `debug` when `-v`, else
+/// `info`. Keeping log level in the environment suits production / container deploys (PRD-0009 T-005).
+fn log_directive(verbose: bool, rust_log: Option<&str>) -> String {
+    match rust_log.filter(|value| !value.is_empty()) {
+        Some(directive) => directive.to_owned(),
+        None if verbose => "debug".to_owned(),
+        None => "info".to_owned(),
     }
 }
 
@@ -542,19 +556,20 @@ fn parse_admin_binding(spec: &str) -> (String, Option<String>) {
 
 #[derive(Args, Debug)]
 struct ServeArgs {
-    /// Address to bind the WSS endpoint to.
-    #[arg(long, default_value = "0.0.0.0:4390")]
+    /// Address to bind the WSS endpoint to (env: `CONCLAVE_BIND`).
+    #[arg(long, env = "CONCLAVE_BIND", default_value = "0.0.0.0:4390")]
     bind: String,
-    /// Directory for the embedded database and server state (required unless `--ephemeral`).
-    #[arg(long)]
+    /// Directory for the embedded database and server state, required unless `--ephemeral`
+    /// (env: `CONCLAVE_DATA_DIR`).
+    #[arg(long, env = "CONCLAVE_DATA_DIR")]
     data_dir: Option<PathBuf>,
     /// Run with a throwaway in-memory store instead of `--data-dir` (tests / experiments only; all
     /// state is lost on restart). Prevents a mis-templated deploy from silently running in-memory.
     #[arg(long, conflicts_with = "data_dir")]
     ephemeral: bool,
-    /// Username granted server-wide admin as `user[=<pubkey-b64>]` (repeatable). Pin the key to
-    /// stop the name being squatted on a fresh deploy; bare `user` is unpinned (DESIGN.md §7).
-    #[arg(long = "admin", value_name = "USER[=PUBKEY]")]
+    /// Username granted server-wide admin as `user[=<pubkey-b64>]` (repeatable; comma-separated in
+    /// the env var `CONCLAVE_ADMINS`). Pin the key to stop the name being squatted (DESIGN.md §7).
+    #[arg(long = "admin", env = "CONCLAVE_ADMINS", value_delimiter = ',', value_name = "USER[=PUBKEY]")]
     admins: Vec<String>,
 }
 
@@ -850,6 +865,16 @@ mod tests {
         let cli = Cli::parse_from(["conclave", "-v", "key"]);
         assert!(cli.verbose);
         assert_eq!(cli.command.verb(), "key");
+    }
+
+    #[test]
+    fn log_config_directive_precedence() {
+        assert_eq!(log_directive(false, None), "info");
+        assert_eq!(log_directive(true, None), "debug");
+        // RUST_LOG overrides the -v / default; an empty RUST_LOG is ignored.
+        assert_eq!(log_directive(false, Some("warn")), "warn");
+        assert_eq!(log_directive(true, Some("trace")), "trace");
+        assert_eq!(log_directive(true, Some("")), "debug");
     }
 
     #[test]

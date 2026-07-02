@@ -64,7 +64,7 @@ pub async fn serve(config: ServerConfig) -> Void {
 
     spawn_reaper(Arc::clone(&hub));
 
-    let app = Router::new().route("/", get(ws_handler)).with_state(hub);
+    let app = Router::new().route("/", get(ws_handler)).route("/health", get(health)).with_state(hub);
     let listener = TcpListener::bind(&config.bind).await.with_context(|| format!("failed to bind `{}`", config.bind))?;
     let addr = listener.local_addr().context("failed to read the bound address")?;
     tracing::info!(%addr, "conclave server listening");
@@ -85,6 +85,12 @@ fn spawn_reaper(hub: Arc<Hub>) {
             }
         }
     });
+}
+
+/// A liveness endpoint for platform health checks: the origin is otherwise WS-only, so an HTTP GET
+/// to `/` returns 426 Upgrade Required — a real 200 endpoint fits any platform's HTTP check (T-004).
+async fn health() -> &'static str {
+    "ok"
 }
 
 /// The WebSocket upgrade handler; every connection is dispatched to [`handle_ws`].

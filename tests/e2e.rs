@@ -25,7 +25,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines},
+    io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader, Lines},
     net::TcpStream,
     process::{ChildStdin, ChildStdout},
     time::timeout,
@@ -178,6 +178,29 @@ fn e2e_serve_requires_a_data_dir_or_ephemeral() {
     assert!(!output.status.success(), "serve without --data-dir or --ephemeral must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("data-dir"), "the error must point at --data-dir; got: {stderr}");
+}
+
+#[tokio::test]
+async fn e2e_serve_health_endpoint_returns_ok() {
+    let data_dir = TempDir::new().unwrap();
+    let addr = free_loopback_addr();
+    let _server = ServerProcess(
+        Command::new(CONCLAVE_BIN)
+            .args(["serve", "--bind", &addr.to_string(), "--data-dir", data_dir.path().to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn `conclave serve`"),
+    );
+    wait_for_listener(addr).await;
+
+    // A raw HTTP GET /health over TCP — the path a platform health check uses (PRD-0009 T-004).
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "health check must return 200, got: {:?}", response.lines().next());
+    assert!(response.trim_end().ends_with("ok"), "health check body must be `ok`, got: {response:?}");
 }
 
 /// Reserves an ephemeral loopback port (staggered ports, DESIGN.md §17) and frees it for the server.

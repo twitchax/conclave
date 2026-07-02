@@ -171,6 +171,13 @@ workspace = false
 command = "cargo"
 args = ["build", "--target", "aarch64-apple-darwin", "--release"]
 
+# Build the `conclave serve` container image (PRD-0009 T-003).
+[tasks.docker-build]
+cwd = "."
+workspace = false
+command = "docker"
+args = ["build", "-t", "conclave:latest", "."]
+
 # =============================================================================
 # Release hygiene
 # =============================================================================

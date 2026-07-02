@@ -66,6 +66,48 @@ cargo install conclave-cli
 
 The published crate is `conclave-cli`; the installed binary is `conclave`.
 
+## Deploy
+
+`conclave serve` is a single self-contained binary. TLS terminates at the edge (Fly.io's proxy or a
+cloudflared tunnel); the server speaks plain WS on its internal port, and clients dial `wss://`.
+
+### Fly.io
+
+A [`Dockerfile`](Dockerfile) and [`fly.toml`](fly.toml) are included. Config is env-driven
+(`CONCLAVE_BIND` / `CONCLAVE_DATA_DIR` / `CONCLAVE_ADMINS`), and the SurrealKV store persists on a
+mounted volume.
+
+```bash
+# 1. Create the app + a volume for the store.
+fly apps create my-conclave                 # then set `app = "my-conclave"` in fly.toml
+fly volumes create conclave_data --region iad --size 1
+
+# 2. Pin the server admin to YOUR key, so the name can't be squatted on the fresh deploy.
+conclave key                                # prints this machine's public key
+fly secrets set CONCLAVE_ADMINS="aaron=<that-public-key>"
+
+# 3. Deploy.
+fly deploy
+```
+
+Then register and drive it from a local session over TLS:
+
+```bash
+conclave register aaron --server wss://my-conclave.fly.dev
+conclave join ops     --server wss://my-conclave.fly.dev
+```
+
+> `serve` requires a persistent `--data-dir` (the image sets `/data`) and refuses to start otherwise,
+> so a mis-templated deploy can't silently run in-memory and wipe state on restart — pass
+> `--ephemeral` only for throwaway/local runs. `GET /health` is the liveness endpoint for platform
+> checks; `RUST_LOG` controls the log level.
+
+### Self-hosted (cloudflared)
+
+Run `conclave serve --data-dir <path> --admin you=<pubkey>` behind a
+[cloudflared tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+that terminates TLS and forwards to the local `ws://` origin; clients dial the tunnel's `wss://` URL.
+
 ## Protocol
 
 Versioned frames ([`ProtocolMessage`](src/protocol.rs)) are `bincode`-encoded and length-delimited

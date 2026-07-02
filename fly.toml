@@ -1,0 +1,40 @@
+# Fly.io deployment for `conclave serve` (PRD-0009 T-004).
+#
+# TLS terminates at Fly's edge (`force_https`); the app speaks plain WS on its internal port, matching
+# the design's TLS-at-the-edge model (DESIGN §11/§12). Durable state lives on a mounted volume at
+# /data. Set your app name and region, create the volume, set the admin secret, then `fly deploy`.
+
+app = "conclave"          # change to your app: `fly apps create <name>`
+primary_region = "iad"    # change to your nearest region: `fly platform regions`
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  CONCLAVE_BIND = "0.0.0.0:4390"
+  CONCLAVE_DATA_DIR = "/data"
+  RUST_LOG = "info"
+  # Do NOT put the admin here — set it as a secret so the name is pinned to your key:
+  #   fly secrets set CONCLAVE_ADMINS="you=<your-pubkey-b64-from-`conclave key`>"
+
+# Persist the SurrealKV store across deploys/restarts. Create it once:
+#   fly volumes create conclave_data --region iad --size 1
+[[mounts]]
+  source = "conclave_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 4390
+  force_https = true
+  # A relay must stay up to hold live WebSocket sessions — do not auto-stop.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  # HTTP liveness on the dedicated /health route (the `/` origin is WS-only and returns 426).
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    timeout = "2s"
+    method = "GET"
+    path = "/health"

@@ -79,11 +79,11 @@ development-channel flag (a normally-registered MCP server has `claude/channel` 
 
    ```bash
    claude --dangerously-load-development-channels \
-     'server:conclave=conclave bridge --server ws://your.server --as my-session'
+     'server:conclave=conclave bridge --server wss://your.server --as my-session'
    ```
 
-   > The client dials plain `ws://` today. `wss://` (TLS to a public edge such as cloudflared or
-   > fly.io) requires the client-side TLS backend tracked in **PRD-0009**.
+   > The client dials `wss://` (rustls, PRD-0009 T-001) for a TLS-fronted server, or plain `ws://`
+   > for a local/tunnelless origin — `connect_async` selects TLS by URL scheme.
 
    > `--dangerously-load-development-channels` is for local channel development only. The alternative
    > is the `allowedChannelPlugins` managed-settings allowlist. Without one of these, CC strips
