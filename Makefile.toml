@@ -7,6 +7,10 @@
 # =============================================================================
 # Tool installation (large executables via `cargo binstall`, never built from source)
 # =============================================================================
+#
+# `--force` on every install: CI's rust-cache can restore binstall's install manifest (the tool
+# shows as "already installed") without the actual `~/.cargo/bin` binary, after which the tool's
+# command fails with "no such command". Forcing the install always materializes the binary.
 
 [tasks.install-cargo-binstall]
 # In CI this is provided by the cargo-bins/cargo-binstall@main action; locally, install once
@@ -16,22 +20,22 @@ script = "echo 'Checking cargo-binstall availability...'"
 [tasks.install-nextest]
 dependencies = ["install-cargo-binstall"]
 command = "cargo"
-args = ["binstall", "cargo-nextest", "--no-confirm", "--locked"]
+args = ["binstall", "cargo-nextest", "--no-confirm", "--locked", "--force"]
 
 [tasks.install-llvm-cov]
 dependencies = ["install-cargo-binstall"]
 command = "cargo"
-args = ["binstall", "cargo-llvm-cov", "--no-confirm", "--locked"]
+args = ["binstall", "cargo-llvm-cov", "--no-confirm", "--locked", "--force"]
 
 [tasks.install-cargo-release]
 dependencies = ["install-cargo-binstall"]
 command = "cargo"
-args = ["binstall", "cargo-release", "--no-confirm", "--locked"]
+args = ["binstall", "cargo-release", "--no-confirm", "--locked", "--force"]
 
 [tasks.install-git-cliff]
 dependencies = ["install-cargo-binstall"]
 command = "cargo"
-args = ["binstall", "git-cliff", "--no-confirm", "--locked"]
+args = ["binstall", "git-cliff", "--no-confirm", "--locked", "--force"]
 
 [tasks.tools]
 dependencies = ["install-nextest", "install-llvm-cov"]
