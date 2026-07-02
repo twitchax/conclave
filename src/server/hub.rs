@@ -401,6 +401,14 @@ impl Hub {
                 if !self.is_admin(user) {
                     return Err(AclError::NotAdmin.into());
                 }
+                // Delete the channels this user created (cascading their memberships + invites) and
+                // purge the user's memberships elsewhere, so re-registering the freed name cannot
+                // inherit channel-admin rights or private access (finding #6).
+                for channel in self.store.list_channels_created_by(&username).await.map_err(internal)? {
+                    self.store.delete_channel(&channel).await.map_err(internal)?;
+                    self.drop_channel(&channel);
+                }
+                self.store.delete_user_memberships(&username).await.map_err(internal)?;
                 for machine in self.store.list_machines(&username).await.map_err(internal)? {
                     self.store.delete_machine(&username, &machine.name).await.map_err(internal)?;
                 }
@@ -747,5 +755,24 @@ mod tests {
         // Membership must carry the creator plus every joiner — normalized rows, no lost writes.
         let members = hub.store.list_channel_members("ops").await.unwrap();
         assert_eq!(members.len(), JOINERS + 1, "concurrent joins must not lose a membership, got {members:?}");
+    }
+
+    // PRD-0007 T-004 — removing a user purges their memberships and created channels, so the freed
+    // username cannot be re-registered to inherit private access or channel-admin rights (finding #6).
+
+    #[tokio::test]
+    async fn user_remove_purges_memberships_and_created_channels() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_user("victim").await.unwrap();
+        // The victim owns one channel and is a member of another they did not create.
+        store.create_channel("victim-ops", Visibility::Private, "victim").await.unwrap();
+        store.create_channel("lobby", Visibility::Public, "aaron").await.unwrap();
+        store.add_channel_member("lobby", "victim").await.unwrap();
+        let hub = Hub::new(store, HashMap::from([("root".to_owned(), None)]));
+
+        hub.admin("root", AdminOp::UserRemove { username: "victim".to_owned() }).await.unwrap();
+
+        assert!(hub.store.get_channel("victim-ops").await.unwrap().is_none(), "a removed user's created channels must be deleted");
+        assert!(!hub.store.is_channel_member("lobby", "victim").await.unwrap(), "a removed user's memberships must be purged");
     }
 }

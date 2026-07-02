@@ -479,6 +479,37 @@ impl Store {
         response.take(0).context("failed to decode membership users")
     }
 
+    /// The names of the channels created (and administered) by `user`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_channels_created_by(&self, user: &str) -> Res<Vec<String>> {
+        let mut response = self
+            .db
+            .query("SELECT VALUE name FROM channel WHERE created_by = $user")
+            .bind(ByUser { user: user.to_owned() })
+            .await
+            .context("failed to list created channels")?;
+        response.take(0).context("failed to decode channel names")
+    }
+
+    /// Removes every membership held by `user` (used when a user is removed, DESIGN.md §7).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn delete_user_memberships(&self, user: &str) -> Void {
+        self.db
+            .query("DELETE membership WHERE user = $user")
+            .bind(ByUser { user: user.to_owned() })
+            .await
+            .context("failed to delete user memberships")?
+            .check()
+            .context("user membership delete reported an error")?;
+        Ok(())
+    }
+
     /// Changes a channel's visibility tier.
     ///
     /// # Errors
@@ -511,7 +542,7 @@ impl Store {
             .context("failed to rename channel")?
             .check()
             .context("channel rename reported an error")?;
-        // Keep memberships attached to the renamed channel.
+        // Keep memberships and invites attached to the renamed channel (PRD-0007 T-004).
         self.db
             .query("UPDATE membership SET channel = $new WHERE channel = $old")
             .bind(Rename { old: old.to_owned(), new: new.to_owned() })
@@ -519,6 +550,13 @@ impl Store {
             .context("failed to migrate channel memberships")?
             .check()
             .context("membership rename reported an error")?;
+        self.db
+            .query("UPDATE invite SET channel = $new WHERE channel = $old")
+            .bind(Rename { old: old.to_owned(), new: new.to_owned() })
+            .await
+            .context("failed to migrate channel invites")?
+            .check()
+            .context("invite rename reported an error")?;
         Ok(())
     }
 
@@ -535,7 +573,8 @@ impl Store {
             .context("failed to delete channel")?
             .check()
             .context("channel delete reported an error")?;
-        // Drop the channel's memberships so a future same-named channel does not inherit them.
+        // Drop the channel's memberships and invites so a future same-named channel cannot inherit
+        // them (invite cascade — PRD-0007 T-004, finding #5).
         self.db
             .query("DELETE membership WHERE channel = $channel")
             .bind(ByChannel { channel: name.to_owned() })
@@ -543,6 +582,13 @@ impl Store {
             .context("failed to delete channel memberships")?
             .check()
             .context("membership delete reported an error")?;
+        self.db
+            .query("DELETE invite WHERE channel = $channel")
+            .bind(ByChannel { channel: name.to_owned() })
+            .await
+            .context("failed to delete channel invites")?
+            .check()
+            .context("invite delete reported an error")?;
         Ok(())
     }
 
@@ -818,6 +864,29 @@ mod tests {
 
         store.delete_invite("tok-123").await.unwrap();
         assert!(store.get_invite("tok-123").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn invites_are_dropped_when_the_channel_is_deleted() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        store.create_invite("ops", "tok", Some(5), None, "aaron").await.unwrap();
+
+        store.delete_channel("ops").await.unwrap();
+        assert!(
+            store.get_invite("tok").await.unwrap().is_none(),
+            "deleting a channel must drop its invites so a future same-named channel cannot honor them"
+        );
+    }
+
+    #[tokio::test]
+    async fn invites_follow_a_channel_rename() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        store.create_invite("ops", "tok", None, None, "aaron").await.unwrap();
+
+        store.rename_channel("ops", "operations").await.unwrap();
+        assert_eq!(store.get_invite("tok").await.unwrap().unwrap().channel, "operations", "an invite must follow its renamed channel");
     }
 
     #[tokio::test]
