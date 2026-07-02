@@ -82,6 +82,7 @@ pub async fn one_shot(url: &str, identity: &Identity, session: &str, request: Pr
 }
 
 async fn connect(url: &str) -> Res<Ws> {
+    crate::base::ensure_tls_provider();
     let (ws, _response) = tokio_tungstenite::connect_async(url).await.with_context(|| format!("failed to connect to `{url}`"))?;
     Ok(ws)
 }

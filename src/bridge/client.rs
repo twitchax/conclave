@@ -133,6 +133,7 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Dials a server over WebSocket and completes the challenge-response handshake, returning an
 /// authenticated [`LinkIo`] backed by translation pumps (frames ⇄ WS binary messages).
 pub(crate) async fn connect_ws(url: &str, identity: &Identity, session: &str) -> Res<LinkIo> {
+    crate::base::ensure_tls_provider();
     let (ws, _response) = tokio_tungstenite::connect_async(url).await.with_context(|| format!("failed to connect to `{url}`"))?;
     let (mut sink, mut stream) = ws.split();
 
@@ -319,5 +320,31 @@ mod tests {
 
         shutdown.notify_waiters();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn connect_ws_dials_wss_with_tls_enabled() {
+        // A plain-TCP listener that reads the client's TLS ClientHello then closes — NOT a TLS
+        // server. Dialing it over wss:// must install the crypto provider and attempt TLS (rustls
+        // 0.23 would otherwise panic), then fail on the non-TLS peer — never returning tungstenite's
+        // "TLS support not compiled in" as it did before PRD-0009 T-001.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt as _;
+                let mut buf = [0_u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                drop(socket);
+            }
+        });
+
+        let identity = Identity::generate().unwrap();
+        let url = format!("wss://127.0.0.1:{}/", addr.port());
+        let dial = connect_ws(&url, &identity, "s");
+        // Ok(Err(_)) = dialed within the timeout and failed at the TLS handshake (the desired
+        // outcome); Ok(Ok(_)) would be an impossible success; Err(_) would be a hang.
+        let dialed_and_failed = matches!(tokio::time::timeout(Duration::from_secs(10), dial).await, Ok(Err(_)));
+        assert!(dialed_and_failed, "a wss:// dial to a non-TLS peer must fail at the TLS handshake, not panic, hang, or succeed");
     }
 }

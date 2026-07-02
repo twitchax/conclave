@@ -58,7 +58,12 @@ thiserror = "2"
 # to the M1 baseline.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "net", "signal"] }
 # The bridge's outbound WS client to central servers (M3); also drives the M2 e2e test client.
-tokio-tungstenite = "0.29"
+# `rustls-tls-webpki-roots` lets the client dial `wss://` (TLS terminates at the cloudflared/fly.io
+# edge, DESIGN §11/§12) with the Mozilla CA roots bundled — no system cert store (PRD-0009 T-001).
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+# Pulled transitively by tokio-tungstenite's TLS; depended on directly only to install a process
+# default crypto provider — rustls 0.23 cannot auto-pick when several are compiled in (PRD-0009 T-001).
+rustls = "0.23"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }

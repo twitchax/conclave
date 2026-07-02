@@ -17,6 +17,18 @@ pub type Res<T> = anyhow::Result<T, Err>;
 /// A helper type for void results.
 pub type Void = Res<()>;
 
+/// Installs the process-default `rustls` crypto provider (aws-lc-rs) once, so the client's
+/// `tokio_tungstenite::connect_async` can build a TLS config for a `wss://` server. rustls 0.23
+/// cannot auto-select a provider when several are compiled in (aws-lc-rs via the store, ring via the
+/// identity keys), so the client installs one explicitly before dialing. Idempotent (PRD-0009 T-001).
+pub(crate) fn ensure_tls_provider() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 /// A home for the project's magic values, so they are named once and reused.
 pub struct Constant;
 
