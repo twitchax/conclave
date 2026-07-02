@@ -176,6 +176,8 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
         }
     };
     let _ = outbound.send(ProtocolMessage::Established { path: path.clone() });
+    // Advertise the server-wide role so the bridge can gate its admin tools (DESIGN.md §7).
+    let _ = outbound.send(ProtocolMessage::ServerInfo { admin: hub.is_admin(&user) });
     Some(SessionCtx { path, kill })
 }
 
@@ -209,6 +211,22 @@ async fn handle_frame(hub: &Arc<Hub>, ctx: &SessionCtx, outbound: &Outbound, fra
         ProtocolMessage::ListChannels => match hub.list_channels(user).await {
             Ok(channels) => {
                 let _ = outbound.send(ProtocolMessage::ChannelList { channels });
+            }
+            Err(e) => {
+                let _ = outbound.send(err(e));
+            }
+        },
+        ProtocolMessage::ListMachines => match hub.list_machines(user).await {
+            Ok(machines) => {
+                let _ = outbound.send(ProtocolMessage::MachineList { machines });
+            }
+            Err(e) => {
+                let _ = outbound.send(err(e));
+            }
+        },
+        ProtocolMessage::ListUsers => match hub.list_users(user).await {
+            Ok(users) => {
+                let _ = outbound.send(ProtocolMessage::UserList { users });
             }
             Err(e) => {
                 let _ = outbound.send(err(e));

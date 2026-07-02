@@ -73,7 +73,7 @@ impl Client {
         })
         .await;
         self.send(ProtocolMessage::Auth { pubkey, signature }).await;
-        self.recv().await
+        self.recv_auth_result().await
     }
 
     /// Authenticates an already-enrolled key under a session handle; returns the server's response.
@@ -86,7 +86,16 @@ impl Client {
             signature,
         })
         .await;
-        self.recv().await
+        self.recv_auth_result().await
+    }
+
+    /// Reads the post-`Auth` frame, consuming the trailing `ServerInfo` on a successful `Established`.
+    async fn recv_auth_result(&mut self) -> ProtocolMessage {
+        let response = self.recv().await;
+        if matches!(response, ProtocolMessage::Established { .. }) {
+            let _ = self.recv().await;
+        }
+        response
     }
 
     async fn hello(&mut self, session: &str) {

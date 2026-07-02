@@ -282,10 +282,15 @@ framing **and** the permission-relay (§12) — conclave does not control them d
    encrypted-payload envelope + key-id so adding E2E (§19) is additive, not a breaking change.
 5. **CLI** — arg parsing + dispatch (`serve`, `bridge`, `key`, `register`, `machine …`,
    `channel …`, `acl …`, `invite …`, `kick`, `ban`, `user …`, `perm …`, `join`).
-6. **`/join` skill** — the Claude Code-side UX. The `conclave` bridge is installed **once** as an
-   MCP server (always spawned, **running-but-offline** until you join); `/join` does **not** launch
-   it — it calls the running bridge's `join_channel` tool to connect + subscribe (optionally with
-   `--perm`).
+6. **`conclave` skill** (M4-reframed) — the Claude Code-side UX, **owned by the CLI** rather than a
+   separate hand-maintained file. `conclave skill` prints a complete `SKILL.md`; `conclave skill
+   install` writes it under `~/.claude/skills/conclave/` so `/conclave` is available. It is one
+   comprehensive guide to the whole fabric — the mental model, the two surfaces (in-session **MCP
+   tools** vs. the setup/admin **CLI**), and the one-time dev-channel install — with an
+   auto-generated command reference walked from the clap tree so flags never drift. **Joining is one
+   section:** the bridge is installed **once** as an MCP server (always spawned, **running-but-
+   offline** until you join), and joining calls the running bridge's `join_channel` tool to connect +
+   subscribe (optionally with `--perm`) — it does **not** launch the bridge.
 
 ## 14. Data flow
 

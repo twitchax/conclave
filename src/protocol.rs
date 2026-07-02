@@ -56,6 +56,17 @@ pub struct ChannelInfo {
     pub member: bool,
 }
 
+/// An enrolled machine as surfaced by [`ProtocolMessage::MachineList`] (`machine list`, §5.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineInfo {
+    /// The machine name (unique within the user).
+    pub name: String,
+    /// The machine's public key, base64-encoded.
+    pub pubkey: String,
+    /// RFC 3339 enrollment timestamp.
+    pub added_at: String,
+}
+
 /// An admin / moderation operation (DESIGN.md §7), authorized server-side by user role.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminOp {
@@ -264,6 +275,30 @@ pub enum ProtocolMessage {
     Ping,
     /// Server → client: keepalive acknowledgement.
     Pong,
+    // ---------------------------------------------------------------------
+    // M4 additions — appended (forward-compat): machine / user listing and the
+    // post-auth server-role signal that gates the bridge's admin tools.
+    // ---------------------------------------------------------------------
+    /// Server → client, immediately after [`ProtocolMessage::Established`]: the authenticated user's
+    /// server-wide role, so the bridge can gate its admin tools (DESIGN.md §7).
+    ServerInfo {
+        /// Whether the user is a server admin (on the serve-config allowlist).
+        admin: bool,
+    },
+    /// Client → server: list the machines enrolled under the authenticated user.
+    ListMachines,
+    /// Server → client: the caller's enrolled machines.
+    MachineList {
+        /// The machines under the caller's account.
+        machines: Vec<MachineInfo>,
+    },
+    /// Client → server: list the server's users (server-admin only).
+    ListUsers,
+    /// Server → client: the registered usernames (server-admin only).
+    UserList {
+        /// The registered usernames.
+        users: Vec<String>,
+    },
 }
 
 /// Errors that cross the wire as a [`ProtocolMessage::Error`] frame and are matched on by the
@@ -450,6 +485,23 @@ mod tests {
         assert_round_trips(&ProtocolMessage::InviteToken { token: "tok-abc".to_owned() });
         assert_round_trips(&ProtocolMessage::Ping);
         assert_round_trips(&ProtocolMessage::Pong);
+    }
+
+    #[test]
+    fn m4_frames_round_trip() {
+        assert_round_trips(&ProtocolMessage::ServerInfo { admin: true });
+        assert_round_trips(&ProtocolMessage::ListMachines);
+        assert_round_trips(&ProtocolMessage::MachineList {
+            machines: vec![MachineInfo {
+                name: "workstation".to_owned(),
+                pubkey: "PUBKEY".to_owned(),
+                added_at: "2026-07-02T00:00:00Z".to_owned(),
+            }],
+        });
+        assert_round_trips(&ProtocolMessage::ListUsers);
+        assert_round_trips(&ProtocolMessage::UserList {
+            users: vec!["aaron".to_owned(), "david".to_owned()],
+        });
     }
 
     #[test]

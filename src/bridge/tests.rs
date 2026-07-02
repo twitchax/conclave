@@ -16,9 +16,9 @@ use tokio::sync::mpsc;
 
 use super::{BridgeCore, mcp::FromMcp, mcp::McpSink};
 use crate::{
-    base::{PermissionLevel, SessionPath},
+    base::{PermissionLevel, SessionPath, Visibility},
     identity::{Config, PermissionOverride, ServerRegistration},
-    protocol::{Payload, ProtocolMessage},
+    protocol::{AdminOp, Payload, ProtocolMessage},
 };
 
 use super::sink::{Injection, NotificationSink};
@@ -218,6 +218,67 @@ fn bridge_perm_emit_tools_are_gated_by_converse() {
 // -----------------------------------------------------------------------------
 // Tool ⇄ response correlation.
 // -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// uat-003 — gated admin MCP tools.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn bridge_admin_tools_hidden_until_the_server_marks_admin() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    // No ServerInfo yet → the admin tools are not offered.
+    let names: Vec<&str> = harness.core.tools().iter().map(|t| t.name).collect();
+    assert!(!names.contains(&"create_channel"));
+    assert!(!names.contains(&"kick"));
+
+    // The server signals admin → every admin tool is offered.
+    harness.core.handle_inbound("s1", ProtocolMessage::ServerInfo { admin: true });
+    let names: Vec<&str> = harness.core.tools().iter().map(|t| t.name).collect();
+    for tool in [
+        "create_channel",
+        "delete_channel",
+        "set_visibility",
+        "acl_add",
+        "acl_remove",
+        "invite_create",
+        "invite_revoke",
+        "kick",
+        "ban",
+    ] {
+        assert!(names.contains(&tool), "admin tool `{tool}` must be offered to an admin");
+    }
+
+    // A subsequent non-admin signal withdraws them.
+    harness.core.handle_inbound("s1", ProtocolMessage::ServerInfo { admin: false });
+    assert!(!harness.core.tools().iter().any(|t| t.name == "create_channel"), "admin tools must be withdrawn for a non-admin");
+}
+
+#[test]
+fn bridge_admin_tools_dispatch_an_admin_op_and_resolve_on_ack() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    harness.core.handle_inbound("s1", ProtocolMessage::ServerInfo { admin: true });
+
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(5),
+        name: "create_channel".to_owned(),
+        args: json!({ "name": "ops", "visibility": "private" }),
+    });
+
+    // The admin op is sent to the server; the tool result is deferred.
+    match harness.to_server_rx.try_recv().unwrap() {
+        ProtocolMessage::Admin(AdminOp::CreateChannel { name, visibility }) => {
+            assert_eq!(name, "ops");
+            assert_eq!(visibility, Visibility::Private);
+        }
+        other => panic!("expected Admin(CreateChannel), got {other:?}"),
+    }
+    assert!(harness.to_mcp_rx.try_recv().is_err());
+
+    // The server's ack resolves the tool call by id.
+    harness.core.handle_inbound("s1", ProtocolMessage::Ack { detail: Some("ops".to_owned()) });
+    assert_eq!(harness.to_mcp_rx.try_recv().unwrap().get("id"), Some(&json!(5)));
+}
 
 #[test]
 fn bridge_join_channel_tool_defers_then_resolves_on_the_ack() {

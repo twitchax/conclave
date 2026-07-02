@@ -16,9 +16,11 @@
 
 pub mod base;
 pub mod bridge;
+pub mod control;
 pub mod identity;
 pub mod protocol;
 pub mod server;
+pub mod skill;
 pub mod store;
 
 pub mod tests;

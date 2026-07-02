@@ -54,16 +54,16 @@ fn e2e_help_advertises_the_command_surface() {
 }
 
 #[test]
-fn e2e_unimplemented_command_fails_cleanly() {
-    let workdir = TempDir::new().unwrap();
+fn e2e_key_generates_a_keypair_into_the_config_dir() {
+    let config = TempDir::new().unwrap();
+    let output = Command::new(CONCLAVE_BIN)
+        .args(["--config-dir", config.path().to_str().unwrap(), "key"])
+        .output()
+        .expect("failed to spawn `conclave key`");
 
-    let output = Command::new(CONCLAVE_BIN).arg("key").current_dir(workdir.path()).output().expect("failed to spawn `conclave key`");
-
-    // M0 stub: the command parses but the verb is unimplemented, so it exits non-zero with a
-    // clear message rather than a panic or a silent success.
-    assert!(!output.status.success(), "expected `key` to fail in the M0 scaffold");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("not yet implemented"), "stderr is missing the unimplemented notice: {stderr}");
+    assert!(output.status.success(), "`key` failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty(), "`key` should print a public key");
+    assert!(config.path().join("key").exists(), "`key` should write the keyfile into the config dir");
 }
 
 /// A live WebSocket connection to the spawned server, framed one [`ProtocolMessage`] per message.
@@ -169,7 +169,11 @@ async fn ws_send(ws: &mut Ws, frame: &ProtocolMessage) {
 async fn ws_recv(ws: &mut Ws) -> ProtocolMessage {
     loop {
         match ws.next().await.expect("websocket closed").unwrap() {
-            Message::Binary(data) => return decode(&data).unwrap(),
+            Message::Binary(data) => match decode(&data).unwrap() {
+                // The post-auth ServerInfo role signal is not asserted here; skip it.
+                ProtocolMessage::ServerInfo { .. } => {}
+                frame => return frame,
+            },
             Message::Ping(_) | Message::Pong(_) => {}
             other => panic!("unexpected websocket message: {other:?}"),
         }
@@ -372,4 +376,155 @@ impl Drop for Bridge {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+// ---------------------------------------------------------------------------
+// M4 — control & admin CLI verbs, and the /join skill flow.
+// ---------------------------------------------------------------------------
+
+/// Spawns `conclave serve` with an optional server-admin allowlist.
+fn spawn_server(addr: SocketAddr, data_dir: &Path, admins: &[&str]) -> ServerProcess {
+    let mut command = Command::new(CONCLAVE_BIN);
+    command.args(["serve", "--bind", &addr.to_string(), "--data-dir", data_dir.to_str().unwrap()]);
+    for admin in admins {
+        command.args(["--admin", admin]);
+    }
+    ServerProcess(command.stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("failed to spawn `conclave serve`"))
+}
+
+/// Runs a `conclave` CLI verb against a config directory and returns its captured output.
+fn run_cli(config_dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(CONCLAVE_BIN)
+        .arg("--config-dir")
+        .arg(config_dir)
+        .args(args)
+        .output()
+        .expect("failed to run a conclave CLI verb")
+}
+
+fn stdout_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[tokio::test]
+async fn cli_control_register_machine_key_join_and_perm() {
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let _server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+
+    let home = TempDir::new().unwrap();
+    let dir = home.path();
+
+    // `key` generates + prints this machine's public key.
+    let key = run_cli(dir, &["key"]);
+    assert!(key.status.success());
+    assert!(!stdout_of(&key).trim().is_empty());
+
+    // `register` claims a username and enrolls this machine.
+    let register = run_cli(dir, &["register", "--server", &url, "--username", "aaron", "--machine", "workstation"]);
+    assert!(register.status.success(), "register failed: {}", String::from_utf8_lossy(&register.stderr));
+
+    // `machine add` enrolls a second key; `machine list` shows both.
+    let laptop_home = TempDir::new().unwrap();
+    let laptop_key = stdout_of(&run_cli(laptop_home.path(), &["key"]));
+    let add = run_cli(dir, &["machine", "add", "--server", &url, "--name", "laptop", "--pubkey", laptop_key.trim()]);
+    assert!(add.status.success(), "machine add failed: {}", String::from_utf8_lossy(&add.stderr));
+
+    let listing = stdout_of(&run_cli(dir, &["machine", "list", "--server", &url]));
+    assert!(listing.contains("workstation") && listing.contains("laptop"), "machine list missing entries: {listing}");
+
+    // `machine remove` revokes it.
+    assert!(run_cli(dir, &["machine", "remove", "--server", &url, "laptop"]).status.success());
+
+    // `perm set` / `perm show` are local.
+    assert!(run_cli(dir, &["perm", "set", "converse", "--server", &url, "--channel", "ops"]).status.success());
+    assert!(stdout_of(&run_cli(dir, &["perm", "show"])).contains("converse"));
+
+    // `join` verifies access to a channel (created here first).
+    assert!(run_cli(dir, &["channel", "create", "--server", &url, "ops"]).status.success());
+    let join = run_cli(dir, &["join", "--server", &url, "ops"]);
+    assert!(join.status.success(), "join failed: {}", String::from_utf8_lossy(&join.stderr));
+}
+
+#[tokio::test]
+async fn cli_admin_verbs_are_role_gated() {
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let _server = spawn_server(addr, server_dir.path(), &["aaron"]); // aaron is a server admin
+    wait_for_listener(addr).await;
+
+    let admin = TempDir::new().unwrap();
+    let user = TempDir::new().unwrap();
+    assert!(run_cli(admin.path(), &["register", "--server", &url, "--username", "aaron", "--machine", "wa"]).status.success());
+    assert!(run_cli(user.path(), &["register", "--server", &url, "--username", "david", "--machine", "wd"]).status.success());
+
+    // The admin can administer channels, ACLs, invites, and list users.
+    assert!(run_cli(admin.path(), &["channel", "create", "--server", &url, "ops", "--visibility", "private"]).status.success());
+    assert!(run_cli(admin.path(), &["acl", "add", "--server", &url, "--channel", "ops", "david"]).status.success());
+    let invite = run_cli(admin.path(), &["invite", "create", "--server", &url, "--channel", "ops", "--uses", "1"]);
+    assert!(invite.status.success() && stdout_of(&invite).contains("invite token"), "invite create failed: {invite:?}");
+    let users = run_cli(admin.path(), &["user", "list", "--server", &url]);
+    assert!(users.status.success() && stdout_of(&users).contains("aaron"));
+
+    // The non-admin is refused server-admin and other-channel-admin operations.
+    assert!(!run_cli(user.path(), &["user", "list", "--server", &url]).status.success(), "non-admin must be refused user list");
+    assert!(
+        !run_cli(user.path(), &["channel", "delete", "--server", &url, "ops"]).status.success(),
+        "non-admin must be refused deleting another's channel"
+    );
+    assert!(
+        !run_cli(user.path(), &["invite", "create", "--server", &url, "--channel", "ops"]).status.success(),
+        "non-admin must be refused minting invites"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_join_skill_join_with_perm_connects_subscribes_and_emits() {
+    // The packaged skill documents the join tool and the /join entry point.
+    let skill = run_cli(TempDir::new().unwrap().path(), &["skill"]);
+    let skill_text = stdout_of(&skill);
+    assert!(skill.status.success());
+    assert!(
+        skill_text.contains("join_channel") && skill_text.contains("/join") && skill_text.contains("perm"),
+        "skill must document /join with a perm"
+    );
+
+    // And the underlying flow works: join_channel with perm=converse subscribes AND lets the session emit.
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let _server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+
+    let aaron_dir = TempDir::new().unwrap();
+    let aaron_id = Identity::generate().unwrap();
+    provision(aaron_dir.path(), &aaron_id, &url, "aaron", "workstation", PermissionLevel::Notify);
+    {
+        let mut ws = ws_connect(addr).await;
+        ws_register(&mut ws, &aaron_id, "aaron", "workstation", "setup").await;
+        ws_send(
+            &mut ws,
+            &ProtocolMessage::Admin(AdminOp::CreateChannel {
+                name: "lobby".to_owned(),
+                visibility: Visibility::Public,
+            }),
+        )
+        .await;
+        assert!(matches!(ws_recv(&mut ws).await, ProtocolMessage::Ack { .. }));
+    }
+
+    let mut alice = Bridge::spawn(aaron_dir.path(), &url, "alice");
+    alice.initialize().await;
+    // /join with a converse perm.
+    alice.call(1, "join_channel", json!({ "channel": "lobby", "perm": "converse" })).await;
+    // Because the perm took effect, the emit tool is now permitted at call time.
+    let sent = alice.call(2, "send_channel", json!({ "channel": "lobby", "text": "joined via the skill" })).await;
+    assert_ne!(
+        sent.pointer("/result/isError").and_then(Value::as_bool),
+        Some(true),
+        "converse perm from --perm must permit send: {sent}"
+    );
 }

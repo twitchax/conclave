@@ -23,7 +23,7 @@ use tokio::{
 use crate::{
     base::{SessionPath, Visibility},
     identity::{self, AuthError},
-    protocol::{AdminOp, ChannelInfo, Payload, ProtocolError, ProtocolMessage},
+    protocol::{AdminOp, ChannelInfo, MachineInfo, Payload, ProtocolError, ProtocolMessage},
     store::{ChannelRecord, Store},
 };
 
@@ -84,8 +84,31 @@ impl Hub {
         self.state.lock().expect("hub state mutex poisoned")
     }
 
-    fn is_admin(&self, user: &str) -> bool {
+    /// Whether `user` is a server-wide admin (on the serve-config allowlist, DESIGN.md §7).
+    pub(crate) fn is_admin(&self, user: &str) -> bool {
         self.admins.contains(user)
+    }
+
+    /// The machines enrolled under `user` (for `machine list`, DESIGN.md §5.1).
+    pub(crate) async fn list_machines(&self, user: &str) -> Result<Vec<MachineInfo>, ProtocolError> {
+        let machines = self.store.list_machines(user).await.map_err(internal)?;
+        Ok(machines
+            .into_iter()
+            .map(|m| MachineInfo {
+                name: m.name,
+                pubkey: m.pubkey,
+                added_at: m.added_at,
+            })
+            .collect())
+    }
+
+    /// The registered usernames — server-admin only (for `user list`, DESIGN.md §7).
+    pub(crate) async fn list_users(&self, caller: &str) -> Result<Vec<String>, ProtocolError> {
+        if !self.is_admin(caller) {
+            return Err(AclError::NotAdmin.into());
+        }
+        let users = self.store.list_users().await.map_err(internal)?;
+        Ok(users.into_iter().map(|u| u.username).collect())
     }
 
     // -----------------------------------------------------------------------

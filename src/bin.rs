@@ -1,15 +1,23 @@
 //! Conclave — the `conclave` binary.
 //!
-//! A thin CLI over `conclavelib`: parse args, initialise tracing, and dispatch to the library.
-//! The full command surface (DESIGN.md §13) is declared here in M0; the verbs behind it land in
-//! M1–M5, so today every command parses and then reports that it is not yet implemented.
+//! A thin CLI over `conclavelib`: parse args, initialise tracing, and dispatch to the library
+//! (DESIGN.md §13). `serve` runs the central server, `bridge` the MCP+WS peer, and the control /
+//! admin verbs are one-shot exchanges via [`conclavelib::control`]; `skill` prints or installs the
+//! packaged Claude Code skill (the whole-CLI guide, generated help included).
 
 #![feature(coverage_attribute)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
-use conclavelib::base::Void;
+use anyhow::Context as _;
+use clap::{Args, CommandFactory as _, Parser, Subcommand};
+use conclavelib::{
+    base::{PermissionLevel, Res, Visibility, Void},
+    control,
+    identity::{self, Identity, PermissionOverride, ServerRegistration},
+    protocol::{AdminOp, ProtocolMessage},
+    skill,
+};
 use tracing::error;
 
 #[coverage(off)]
@@ -26,53 +34,342 @@ async fn main() {
         .with_max_level(level)
         .init();
 
-    if let Err(err) = execute(&cli.command).await {
+    if let Err(err) = execute(&cli).await {
         error!("❌ {err:#}");
         std::process::exit(1);
     }
 }
 
-/// Dispatch a parsed command into `conclavelib`. `serve` (M2) runs the central server; the
-/// remaining verbs land in M3–M5 and for now report themselves unimplemented rather than
-/// silently succeeding.
+/// Dispatches a parsed command into `conclavelib`.
 ///
 /// # Errors
 ///
-/// Returns the subsystem's error for an implemented verb, or an "unimplemented" error otherwise.
-async fn execute(command: &Command) -> Void {
-    match command {
+/// Returns the subsystem's error, or a server-side rejection surfaced as an error frame.
+async fn execute(cli: &Cli) -> Void {
+    let dir = cli.config_dir.as_ref();
+    match &cli.command {
         Command::Serve(args) => {
-            let config = conclavelib::server::ServerConfig {
+            conclavelib::server::serve(conclavelib::server::ServerConfig {
                 bind: args.bind.clone(),
                 data_dir: args.data_dir.clone(),
                 admins: args.admins.iter().cloned().collect(),
-            };
-            conclavelib::server::serve(config).await
+            })
+            .await
         }
-        Command::Bridge(args) => run_bridge(args).await,
-        other => anyhow::bail!("`conclave {}` is not yet implemented (see .prds/)", other.verb()),
+        Command::Bridge(args) => run_bridge(dir, args).await,
+        Command::Key => run_key(dir),
+        Command::Register(args) => run_register(dir, args).await,
+        Command::Machine { command } => run_machine(dir, command).await,
+        Command::Join(args) => run_join(dir, args).await,
+        Command::Perm { command } => run_perm(dir, command),
+        Command::Channel { command } => run_channel(dir, command).await,
+        Command::Acl { command } => run_acl(dir, command).await,
+        Command::Invite { command } => run_invite(dir, command).await,
+        Command::Who(args) => print_response(control::one_shot(&args.server, &load_identity(dir)?, &cli_session(), ProtocolMessage::Who { channel: args.channel.clone() }).await?),
+        Command::Kick(args) => {
+            admin_op(
+                dir,
+                &args.server,
+                AdminOp::Kick {
+                    channel: args.channel.clone(),
+                    target: args.target.clone(),
+                },
+            )
+            .await
+        }
+        Command::Ban(args) => {
+            admin_op(
+                dir,
+                &args.server,
+                AdminOp::Ban {
+                    channel: args.channel.clone(),
+                    user: args.user.clone(),
+                },
+            )
+            .await
+        }
+        Command::User { command } => run_user(dir, command).await,
+        Command::Skill(args) => run_skill(args),
     }
 }
 
-/// Loads the local identity + config and runs the bridge (MCP stdio peer + WS client).
-///
-/// # Errors
-///
-/// Returns an error if the keystore/config cannot be loaded or no server is configured.
-async fn run_bridge(args: &BridgeArgs) -> Void {
-    use anyhow::Context as _;
+// --- Shared helpers -----------------------------------------------------------
 
-    let config_dir = match &args.config_dir {
-        Some(dir) => dir.clone(),
-        None => conclavelib::identity::default_config_dir()?,
-    };
-    let identity = conclavelib::identity::load_identity(&config_dir)?;
-    let config = conclavelib::identity::load_config(&config_dir)?;
+fn config_dir(explicit: Option<&PathBuf>) -> Res<PathBuf> {
+    match explicit {
+        Some(dir) => Ok(dir.clone()),
+        None => identity::default_config_dir(),
+    }
+}
+
+/// A short, per-process session handle for one-shot CLI ops (avoids colliding with a live bridge).
+fn cli_session() -> String {
+    format!("cli-{}", std::process::id())
+}
+
+fn load_identity(explicit: Option<&PathBuf>) -> Res<Identity> {
+    identity::load_identity(&config_dir(explicit)?)
+}
+
+fn load_or_create_identity(dir: &Path) -> Res<Identity> {
+    if dir.join("key").exists() {
+        identity::load_identity(dir)
+    } else {
+        let identity = Identity::generate()?;
+        identity::save_identity(dir, &identity)?;
+        Ok(identity)
+    }
+}
+
+/// Authenticates and sends `op` as an admin frame to `server`, printing the result.
+async fn admin_op(explicit: Option<&PathBuf>, server: &str, op: AdminOp) -> Void {
+    print_response(control::one_shot(server, &load_identity(explicit)?, &cli_session(), ProtocolMessage::Admin(op)).await?)
+}
+
+/// Prints a control response for a human; a server error frame becomes a non-zero exit.
+fn print_response(response: ProtocolMessage) -> Void {
+    match response {
+        ProtocolMessage::Ack { detail } => println!("✓ {}", detail.unwrap_or_else(|| "ok".to_owned())),
+        ProtocolMessage::Joined { channel } => println!("✓ joined {channel}"),
+        ProtocolMessage::InviteToken { token } => println!("invite token: {token}"),
+        ProtocolMessage::Established { path } => println!("✓ {path}"),
+        ProtocolMessage::ChannelList { channels } => {
+            for channel in channels {
+                println!("{}\t{}{}", channel.name, channel.visibility.as_str(), if channel.member { "\t(member)" } else { "" });
+            }
+        }
+        ProtocolMessage::MachineList { machines } => {
+            for machine in machines {
+                println!("{}\t{}\t{}", machine.name, machine.pubkey, machine.added_at);
+            }
+        }
+        ProtocolMessage::UserList { users } => {
+            for user in users {
+                println!("{user}");
+            }
+        }
+        ProtocolMessage::Presence { channel, sessions } => {
+            let scope = channel.unwrap_or_else(|| "server".to_owned());
+            let who = sessions.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", ");
+            println!("[{scope}] {who}");
+        }
+        ProtocolMessage::Error(err) => anyhow::bail!("{err}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+// --- Verb handlers ------------------------------------------------------------
+
+fn run_key(explicit: Option<&PathBuf>) -> Void {
+    let identity = load_or_create_identity(&config_dir(explicit)?)?;
+    println!("{}", identity.public_key_base64());
+    Ok(())
+}
+
+async fn run_register(explicit: Option<&PathBuf>, args: &RegisterArgs) -> Void {
+    let dir = config_dir(explicit)?;
+    let identity = load_or_create_identity(&dir)?;
+    let machine = args.machine.clone().unwrap_or_else(default_machine_name);
+    let path = control::register(&args.server, &identity, &args.username, &machine, &cli_session()).await?;
+
+    let mut config = identity::load_config(&dir)?;
+    config.servers.retain(|s| s.url != args.server);
+    config.servers.push(ServerRegistration {
+        url: args.server.clone(),
+        username: args.username.clone(),
+        machine,
+    });
+    identity::save_config(&dir, &config)?;
+
+    println!("✓ registered {path}");
+    Ok(())
+}
+
+async fn run_machine(explicit: Option<&PathBuf>, command: &MachineCommand) -> Void {
+    match command {
+        MachineCommand::Add { server, name, pubkey } => {
+            let pubkey = identity::decode_key(pubkey).map_err(|e| anyhow::anyhow!("invalid public key: {e}"))?;
+            admin_op(explicit, server, AdminOp::MachineAdd { name: name.clone(), pubkey }).await
+        }
+        MachineCommand::List { server } => print_response(control::one_shot(server, &load_identity(explicit)?, &cli_session(), ProtocolMessage::ListMachines).await?),
+        MachineCommand::Remove { server, name } => admin_op(explicit, server, AdminOp::MachineRemove { name: name.clone() }).await,
+    }
+}
+
+async fn run_join(explicit: Option<&PathBuf>, args: &JoinArgs) -> Void {
+    let dir = config_dir(explicit)?;
+    let identity = load_identity(explicit)?;
+
+    if let Some(perm) = &args.perm {
+        let level: PermissionLevel = perm.parse().map_err(anyhow::Error::from)?;
+        let mut config = identity::load_config(&dir)?;
+        config.overrides.retain(|o| !(o.server == args.server && o.channel.as_deref() == Some(args.channel.as_str())));
+        config.overrides.push(PermissionOverride {
+            server: args.server.clone(),
+            channel: Some(args.channel.clone()),
+            level,
+        });
+        identity::save_config(&dir, &config)?;
+    }
+
+    let response = control::one_shot(
+        &args.server,
+        &identity,
+        &cli_session(),
+        ProtocolMessage::Join {
+            channel: args.channel.clone(),
+            token: args.token.clone(),
+        },
+    )
+    .await?;
+    print_response(response)?;
+    eprintln!("note: verified access and set the local permission; your live session subscribes via the /conclave skill's join_channel tool.");
+    Ok(())
+}
+
+fn run_perm(explicit: Option<&PathBuf>, command: &PermCommand) -> Void {
+    let dir = config_dir(explicit)?;
+    match command {
+        PermCommand::Set { level, server, channel, whisper } => {
+            let level: PermissionLevel = level.parse().map_err(anyhow::Error::from)?;
+            let mut config = identity::load_config(&dir)?;
+            if let Some(server) = server {
+                let scope_channel = if *whisper { None } else { channel.clone() };
+                config.overrides.retain(|o| !(o.server == *server && o.channel == scope_channel));
+                config.overrides.push(PermissionOverride {
+                    server: server.clone(),
+                    channel: scope_channel,
+                    level,
+                });
+            } else if channel.is_none() && !whisper {
+                config.default_permission = level;
+            } else {
+                anyhow::bail!("--channel / --whisper require --server");
+            }
+            identity::save_config(&dir, &config)?;
+            println!("✓ permission updated");
+        }
+        PermCommand::Show => {
+            let config = identity::load_config(&dir)?;
+            println!("default: {}", level_token(config.default_permission));
+            for over in &config.overrides {
+                let scope = over.channel.clone().unwrap_or_else(|| "<whisper>".to_owned());
+                println!("{} {} -> {}", over.server, scope, level_token(over.level));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_channel(explicit: Option<&PathBuf>, command: &ChannelCommand) -> Void {
+    match command {
+        ChannelCommand::Create { server, name, visibility } => {
+            let visibility = parse_visibility(visibility.as_deref())?;
+            admin_op(explicit, server, AdminOp::CreateChannel { name: name.clone(), visibility }).await
+        }
+        ChannelCommand::Delete { server, name } => admin_op(explicit, server, AdminOp::DeleteChannel { name: name.clone() }).await,
+        ChannelCommand::Rename { server, name, new_name } => {
+            admin_op(
+                explicit,
+                server,
+                AdminOp::RenameChannel {
+                    name: name.clone(),
+                    new_name: new_name.clone(),
+                },
+            )
+            .await
+        }
+        ChannelCommand::SetVisibility { server, name, visibility } => {
+            let visibility = visibility.parse().map_err(anyhow::Error::from)?;
+            admin_op(explicit, server, AdminOp::SetVisibility { name: name.clone(), visibility }).await
+        }
+        ChannelCommand::List { server } => print_response(control::one_shot(server, &load_identity(explicit)?, &cli_session(), ProtocolMessage::ListChannels).await?),
+    }
+}
+
+async fn run_acl(explicit: Option<&PathBuf>, command: &AclCommand) -> Void {
+    match command {
+        AclCommand::Add { server, channel, user } => {
+            admin_op(
+                explicit,
+                server,
+                AdminOp::AclAdd {
+                    channel: channel.clone(),
+                    user: user.clone(),
+                },
+            )
+            .await
+        }
+        AclCommand::Remove { server, channel, user } => {
+            admin_op(
+                explicit,
+                server,
+                AdminOp::AclRemove {
+                    channel: channel.clone(),
+                    user: user.clone(),
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn run_invite(explicit: Option<&PathBuf>, command: &InviteCommand) -> Void {
+    match command {
+        InviteCommand::Create { server, channel, uses, expires_in } => {
+            let expires_in_secs = expires_in.as_deref().map(parse_duration_secs).transpose()?;
+            admin_op(
+                explicit,
+                server,
+                AdminOp::InviteCreate {
+                    channel: channel.clone(),
+                    uses: *uses,
+                    expires_in_secs,
+                },
+            )
+            .await
+        }
+        InviteCommand::Revoke { server, token } => admin_op(explicit, server, AdminOp::InviteRevoke { token: token.clone() }).await,
+    }
+}
+
+async fn run_user(explicit: Option<&PathBuf>, command: &UserCommand) -> Void {
+    match command {
+        UserCommand::List { server } => print_response(control::one_shot(server, &load_identity(explicit)?, &cli_session(), ProtocolMessage::ListUsers).await?),
+        UserCommand::Remove { server, username } => admin_op(explicit, server, AdminOp::UserRemove { username: username.clone() }).await,
+    }
+}
+
+fn run_skill(args: &SkillArgs) -> Void {
+    let content = skill::render(&render_command_reference());
+    match &args.command {
+        None | Some(SkillCommand::Show) => print!("{content}"),
+        Some(SkillCommand::Install { dir }) => {
+            let base = match dir {
+                Some(dir) => dir.clone(),
+                None => dirs::home_dir().context("could not determine the home directory")?.join(".claude").join("skills"),
+            };
+            let path = skill::install_path(&base);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| format!("failed to create `{}`", parent.display()))?;
+            }
+            std::fs::write(&path, content).with_context(|| format!("failed to write `{}`", path.display()))?;
+            println!("✓ installed the conclave skill to {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Loads the local identity + config and runs the bridge (MCP stdio peer + WS client).
+async fn run_bridge(explicit: Option<&PathBuf>, args: &BridgeArgs) -> Void {
+    let dir = config_dir(explicit)?;
+    let identity = identity::load_identity(&dir)?;
+    let config = identity::load_config(&dir)?;
     let session = match &args.session {
         Some(session) => session.clone(),
-        None => conclavelib::identity::default_handle(&std::env::current_dir().context("failed to read the working directory")?),
+        None => identity::default_handle(&std::env::current_dir().context("failed to read the working directory")?),
     };
-
     conclavelib::bridge::run(conclavelib::bridge::BridgeSetup {
         identity,
         config,
@@ -82,12 +379,71 @@ async fn run_bridge(args: &BridgeArgs) -> Void {
     .await
 }
 
+// --- Small parsers / renderers ------------------------------------------------
+
+fn default_machine_name() -> String {
+    gethostname::gethostname().to_string_lossy().into_owned()
+}
+
+fn level_token(level: PermissionLevel) -> String {
+    format!("{level:?}").to_lowercase()
+}
+
+fn parse_visibility(value: Option<&str>) -> Res<Visibility> {
+    match value {
+        Some(value) => value.parse().map_err(anyhow::Error::from),
+        None => Ok(Visibility::Public),
+    }
+}
+
+/// Parses a human duration (`30s`, `10m`, `24h`, `7d`, or bare seconds) into seconds.
+fn parse_duration_secs(value: &str) -> Res<u64> {
+    let value = value.trim();
+    let (digits, mult) = match value.chars().last() {
+        Some('s') => (&value[..value.len() - 1], 1),
+        Some('m') => (&value[..value.len() - 1], 60),
+        Some('h') => (&value[..value.len() - 1], 3600),
+        Some('d') => (&value[..value.len() - 1], 86_400),
+        _ => (value, 1),
+    };
+    let count: u64 = digits.trim().parse().with_context(|| format!("invalid duration `{value}`"))?;
+    Ok(count * mult)
+}
+
+/// Renders every subcommand's `--help` into the skill's command reference (always CLI-accurate).
+fn render_command_reference() -> String {
+    let mut out = String::new();
+    append_command_help(&mut out, &Cli::command(), "conclave");
+    out
+}
+
+fn append_command_help(out: &mut String, command: &clap::Command, path: &str) {
+    use std::fmt::Write as _;
+
+    let mut command = command.clone();
+    let help = command.render_long_help().to_string();
+    // Writing to a `String` is infallible.
+    let _ = write!(out, "### `{path}`\n\n```\n{}\n```\n\n", help.trim_end());
+
+    let subcommands: Vec<clap::Command> = command.get_subcommands().cloned().collect();
+    for sub in &subcommands {
+        // Skip clap's auto-generated `help` subcommand.
+        if sub.get_name() != "help" {
+            append_command_help(out, sub, &format!("{path} {}", sub.get_name()));
+        }
+    }
+}
+
 /// Discord-for-agents: shared channels that let Claude Code sessions talk to each other.
 #[derive(Parser, Debug)]
 #[command(name = "conclave", author, version, about, long_about = None, propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Config / keystore directory (defaults to `~/.config/conclave`).
+    #[arg(long, global = true)]
+    config_dir: Option<PathBuf>,
 
     /// Increase logging verbosity to debug level.
     #[arg(short, long, global = true)]
@@ -142,10 +498,13 @@ enum Command {
         #[command(subcommand)]
         command: UserCommand,
     },
+    /// Print or install the packaged Claude Code skill (the whole-CLI guide).
+    Skill(SkillArgs),
 }
 
+#[cfg(test)]
 impl Command {
-    /// The top-level verb, used for diagnostics until the arms are implemented.
+    /// The top-level verb name (used by the CLI parse tests).
     fn verb(&self) -> &'static str {
         match self {
             Command::Serve(_) => "serve",
@@ -162,6 +521,7 @@ impl Command {
             Command::Kick(_) => "kick",
             Command::Ban(_) => "ban",
             Command::User { .. } => "user",
+            Command::Skill(_) => "skill",
         }
     }
 }
@@ -184,9 +544,6 @@ struct BridgeArgs {
     /// Server URL to connect to (repeatable); defaults to the known-servers list.
     #[arg(long = "server")]
     servers: Vec<String>,
-    /// Config / keystore directory (defaults to `~/.config/conclave`).
-    #[arg(long)]
-    config_dir: Option<PathBuf>,
     /// Session handle for this connection; defaults to the working-directory name.
     #[arg(long = "as")]
     session: Option<String>,
@@ -423,6 +780,24 @@ enum UserCommand {
     },
 }
 
+#[derive(Args, Debug)]
+struct SkillArgs {
+    #[command(subcommand)]
+    command: Option<SkillCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommand {
+    /// Print the SKILL.md to stdout (the default).
+    Show,
+    /// Install the skill under the Claude Code skills directory (`/conclave` becomes available).
+    Install {
+        /// Skills directory (defaults to `~/.claude/skills`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +831,22 @@ mod tests {
         let cli = Cli::parse_from(["conclave", "-v", "key"]);
         assert!(cli.verbose);
         assert_eq!(cli.command.verb(), "key");
+    }
+
+    #[test]
+    fn config_dir_is_global_and_parses_after_the_subcommand() {
+        let cli = Cli::parse_from(["conclave", "register", "--server", "wss://s", "--username", "aaron", "--config-dir", "/tmp/x"]);
+        assert_eq!(cli.config_dir.as_deref(), Some(std::path::Path::new("/tmp/x")));
+        assert_eq!(cli.command.verb(), "register");
+    }
+
+    #[test]
+    fn skill_subcommand_parses_show_and_install() {
+        assert_eq!(Cli::parse_from(["conclave", "skill"]).command.verb(), "skill");
+        let install = Cli::parse_from(["conclave", "skill", "install", "--dir", "/tmp/skills"]);
+        match install.command {
+            Command::Skill(args) => assert!(matches!(args.command, Some(SkillCommand::Install { .. }))),
+            other => panic!("expected `skill`, parsed {other:?}"),
+        }
     }
 }

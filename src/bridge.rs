@@ -29,9 +29,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 
 use crate::{
-    base::{PermissionLevel, Res, SessionPath, Void},
+    base::{PermissionLevel, Res, SessionPath, Visibility, Void},
     identity::{Config, Identity, PermissionOverride, Scope, ServerRegistration},
-    protocol::{Payload, ProtocolError, ProtocolMessage},
+    protocol::{AdminOp, Payload, ProtocolError, ProtocolMessage},
 };
 
 use mcp::{FromMcp, McpSink, Tool};
@@ -139,8 +139,10 @@ struct BridgeCore {
     to_mcp: mpsc::UnboundedSender<Value>,
     sink: Box<dyn NotificationSink>,
     servers: HashMap<String, ServerHandle>,
-    /// Per-server FIFO of MCP request ids awaiting a control response (join / list / who).
+    /// Per-server FIFO of MCP request ids awaiting a control response (join / list / who / admin).
     pending: HashMap<String, VecDeque<Value>>,
+    /// Servers on which the authenticated user is an admin (from `ServerInfo`) — gates admin tools.
+    admin_servers: HashSet<String>,
 }
 
 impl BridgeCore {
@@ -152,6 +154,7 @@ impl BridgeCore {
             sink,
             servers: HashMap::new(),
             pending: HashMap::new(),
+            admin_servers: HashSet::new(),
         }
     }
 
@@ -208,8 +211,148 @@ impl BridgeCore {
             "list_channels" => self.tool_list(id, args),
             "who" => self.tool_who(id, args),
             "submit_permission" => self.tool_submit_permission(id, args),
+            "create_channel" => self.tool_create_channel(id, args),
+            "delete_channel" => self.tool_delete_channel(id, args),
+            "set_visibility" => self.tool_set_visibility(id, args),
+            "acl_add" => self.tool_acl(id, args, true),
+            "acl_remove" => self.tool_acl(id, args, false),
+            "invite_create" => self.tool_invite_create(id, args),
+            "invite_revoke" => self.tool_invite_revoke(id, args),
+            "kick" => self.tool_kick(id, args),
+            "ban" => self.tool_ban(id, args),
             other => self.send_mcp(mcp::tool_error_result(id, &format!("unknown tool `{other}`"))),
         }
+    }
+
+    /// Pushes an admin op to the server, deferring its MCP result to the `Ack` / `InviteToken` /
+    /// `Error` response. The server authorizes by role, so a non-admin call is refused server-side.
+    fn defer_admin(&mut self, id: &Value, server: &str, op: AdminOp) {
+        self.pending.entry(server.to_owned()).or_default().push_back(id.clone());
+        self.send_to_server(server, ProtocolMessage::Admin(op));
+    }
+
+    fn tool_create_channel(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let Some(name) = arg_str(args, "name") else {
+            return self.send_mcp(mcp::tool_error_result(id, "`name` is required"));
+        };
+        let visibility = arg_str(args, "visibility").and_then(|v| v.parse().ok()).unwrap_or(Visibility::Public);
+        self.defer_admin(id, &server, AdminOp::CreateChannel { name: name.to_owned(), visibility });
+    }
+
+    fn tool_delete_channel(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let Some(name) = arg_str(args, "name") else {
+            return self.send_mcp(mcp::tool_error_result(id, "`name` is required"));
+        };
+        self.defer_admin(id, &server, AdminOp::DeleteChannel { name: name.to_owned() });
+    }
+
+    fn tool_set_visibility(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let (Some(name), Some(visibility)) = (arg_str(args, "name"), arg_str(args, "visibility").and_then(|v| v.parse::<Visibility>().ok())) else {
+            return self.send_mcp(mcp::tool_error_result(id, "`name` and a valid `visibility` are required"));
+        };
+        self.defer_admin(id, &server, AdminOp::SetVisibility { name: name.to_owned(), visibility });
+    }
+
+    fn tool_acl(&mut self, id: &Value, args: &Value, add: bool) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let (Some(channel), Some(user)) = (arg_str(args, "channel"), arg_str(args, "user")) else {
+            return self.send_mcp(mcp::tool_error_result(id, "`channel` and `user` are required"));
+        };
+        let op = if add {
+            AdminOp::AclAdd {
+                channel: channel.to_owned(),
+                user: user.to_owned(),
+            }
+        } else {
+            AdminOp::AclRemove {
+                channel: channel.to_owned(),
+                user: user.to_owned(),
+            }
+        };
+        self.defer_admin(id, &server, op);
+    }
+
+    fn tool_invite_create(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let Some(channel) = arg_str(args, "channel") else {
+            return self.send_mcp(mcp::tool_error_result(id, "`channel` is required"));
+        };
+        let uses = args.get("uses").and_then(Value::as_u64).and_then(|u| u32::try_from(u).ok());
+        let expires_in_secs = args.get("expires_in_secs").and_then(Value::as_u64);
+        self.defer_admin(
+            id,
+            &server,
+            AdminOp::InviteCreate {
+                channel: channel.to_owned(),
+                uses,
+                expires_in_secs,
+            },
+        );
+    }
+
+    fn tool_invite_revoke(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let Some(token) = arg_str(args, "token") else {
+            return self.send_mcp(mcp::tool_error_result(id, "`token` is required"));
+        };
+        self.defer_admin(id, &server, AdminOp::InviteRevoke { token: token.to_owned() });
+    }
+
+    fn tool_kick(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let (Some(channel), Some(target)) = (arg_str(args, "channel"), arg_str(args, "target")) else {
+            return self.send_mcp(mcp::tool_error_result(id, "`channel` and `target` are required"));
+        };
+        self.defer_admin(
+            id,
+            &server,
+            AdminOp::Kick {
+                channel: channel.to_owned(),
+                target: target.to_owned(),
+            },
+        );
+    }
+
+    fn tool_ban(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let (Some(channel), Some(user)) = (arg_str(args, "channel"), arg_str(args, "user")) else {
+            return self.send_mcp(mcp::tool_error_result(id, "`channel` and `user` are required"));
+        };
+        self.defer_admin(
+            id,
+            &server,
+            AdminOp::Ban {
+                channel: channel.to_owned(),
+                user: user.to_owned(),
+            },
+        );
     }
 
     fn tool_join(&mut self, id: &Value, args: &Value) {
@@ -345,6 +488,14 @@ impl BridgeCore {
             ProtocolMessage::Ack { detail } => self.resolve_pending(server, detail.as_deref().unwrap_or("ok")),
             ProtocolMessage::InviteToken { token } => self.resolve_pending(server, &format!("invite token: {token}")),
             ProtocolMessage::Error(error) => self.resolve_error(server, &error),
+            // The post-auth role signal gates the admin tools (DESIGN.md §7).
+            ProtocolMessage::ServerInfo { admin } => {
+                if admin {
+                    self.admin_servers.insert(server.to_owned());
+                } else {
+                    self.admin_servers.remove(server);
+                }
+            }
             // Keepalive acks and any handshake frames (consumed by the client) are ignored here.
             _ => {}
         }
@@ -396,6 +547,10 @@ impl BridgeCore {
         if self.any_emit_allowed() {
             tools.push(send_channel_tool());
             tools.push(whisper_tool());
+        }
+        // Admin tools are offered only when the user is an admin on some connected server (§7).
+        if !self.admin_servers.is_empty() {
+            tools.extend(admin_tools());
         }
         tools
     }
@@ -571,6 +726,70 @@ fn whisper_tool() -> Tool {
             "required": ["target", "text"]
         }),
     }
+}
+
+/// Admin / moderation tools — offered only to admin users, authorized again by role server-side (§7).
+fn admin_tools() -> Vec<Tool> {
+    let server = json!({ "type": "string", "description": "Server URL (optional if only one is connected)." });
+    vec![
+        Tool {
+            name: "create_channel",
+            description: "Admin: create a channel (visibility public/unlisted/private; default public).",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "server": server, "name": { "type": "string" }, "visibility": { "type": "string", "enum": ["public", "unlisted", "private"] } },
+                "required": ["name"]
+            }),
+        },
+        Tool {
+            name: "delete_channel",
+            description: "Admin: delete a channel.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "name": { "type": "string" } }, "required": ["name"] }),
+        },
+        Tool {
+            name: "set_visibility",
+            description: "Admin: change a channel's visibility (public/unlisted/private).",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "server": server, "name": { "type": "string" }, "visibility": { "type": "string", "enum": ["public", "unlisted", "private"] } },
+                "required": ["name", "visibility"]
+            }),
+        },
+        Tool {
+            name: "acl_add",
+            description: "Admin: add a user to a channel's access-control list.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" }, "user": { "type": "string" } }, "required": ["channel", "user"] }),
+        },
+        Tool {
+            name: "acl_remove",
+            description: "Admin: remove a user from a channel's access-control list.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" }, "user": { "type": "string" } }, "required": ["channel", "user"] }),
+        },
+        Tool {
+            name: "invite_create",
+            description: "Admin: mint an invite token for a channel (optional uses / expires_in_secs).",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "server": server, "channel": { "type": "string" }, "uses": { "type": "integer" }, "expires_in_secs": { "type": "integer" } },
+                "required": ["channel"]
+            }),
+        },
+        Tool {
+            name: "invite_revoke",
+            description: "Admin: revoke an invite token.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "token": { "type": "string" } }, "required": ["token"] }),
+        },
+        Tool {
+            name: "kick",
+            description: "Admin: remove a session path or user from a channel.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" }, "target": { "type": "string" } }, "required": ["channel", "target"] }),
+        },
+        Tool {
+            name: "ban",
+            description: "Admin: ban a user from a channel (drops them and blocks rejoin).",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" }, "user": { "type": "string" } }, "required": ["channel", "user"] }),
+        },
+    ]
 }
 
 #[cfg(test)]

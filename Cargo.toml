@@ -36,6 +36,8 @@ bincode = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+# Hostname for the `register --machine` default (DESIGN.md §5.1); tiny, zero-dependency.
+gethostname = "1"
 # `Stream`/`Sink` combinators to split the axum WebSocket into independent read/write halves so a
 # session can be fanned-out to while it is still reading (M2 session driver).
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink", "async-await"] }
