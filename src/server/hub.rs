@@ -367,10 +367,10 @@ impl Hub {
             AdminOp::InviteCreate { channel, uses, expires_in_secs } => {
                 self.authorize_channel_admin(&channel, user).await?;
                 let token = identity::generate_token().map_err(internal)?;
-                let expires_at = expires_in_secs.map(|secs| {
-                    let secs = i64::try_from(secs).unwrap_or(i64::MAX);
-                    (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339()
-                });
+                let expires_at = match expires_in_secs {
+                    Some(secs) => Some(invite_expiry(secs)?),
+                    None => None,
+                };
                 self.store.create_invite(&channel, &token, uses.map(i64::from), expires_at, user).await.map_err(internal)?;
                 Ok(ProtocolMessage::InviteToken { token })
             }
@@ -634,6 +634,17 @@ fn is_expired(rfc3339: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(rfc3339).map_or(true, |dt| dt.with_timezone(&chrono::Utc) <= chrono::Utc::now())
 }
 
+/// An RFC 3339 expiry `secs` seconds from now, computed with checked arithmetic so an absurd
+/// duration (from the wire or the CLI's `--expires-in`) returns an error instead of overflow-
+/// panicking (PRD-0007 T-005, finding #10).
+fn invite_expiry(secs: u64) -> Result<String, ProtocolError> {
+    let too_far = || ProtocolError::MalformedFrame("invite expiry is too far in the future".to_owned());
+    let secs = i64::try_from(secs).map_err(|_| too_far())?;
+    let delta = chrono::TimeDelta::try_seconds(secs).ok_or_else(too_far)?;
+    let expiry = chrono::Utc::now().checked_add_signed(delta).ok_or_else(too_far)?;
+    Ok(expiry.to_rfc3339())
+}
+
 #[cfg(test)]
 mod tests {
     // Tests relax `unwrap_used` (house convention; DESIGN.md §22).
@@ -774,5 +785,27 @@ mod tests {
 
         assert!(hub.store.get_channel("victim-ops").await.unwrap().is_none(), "a removed user's created channels must be deleted");
         assert!(!hub.store.is_channel_member("lobby", "victim").await.unwrap(), "a removed user's memberships must be purged");
+    }
+
+    // PRD-0007 T-005 — a wildly large invite expiry must return an error, not overflow-panic
+    // (finding #10, reachable from the wire and the CLI's --expires-in).
+
+    #[tokio::test]
+    async fn invite_create_with_absurd_expiry_errors_instead_of_panicking() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        let hub = Hub::new(store, HashMap::new());
+
+        let result = hub
+            .admin(
+                "aaron",
+                AdminOp::InviteCreate {
+                    channel: "ops".to_owned(),
+                    uses: None,
+                    expires_in_secs: Some(u64::MAX),
+                },
+            )
+            .await;
+        assert!(result.is_err(), "an absurd expiry must return an error, got {result:?}");
     }
 }
