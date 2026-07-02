@@ -152,6 +152,20 @@ impl SessionPath {
             session: session.into(),
         }
     }
+
+    /// Validates one path component (a username, machine name, or session handle): it must be
+    /// non-empty and free of the path separator, so the assembled `{user}/{machine}/{session}`
+    /// stays unambiguous and `from`-attribution cannot be spoofed (DESIGN.md §5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParsePathError::Malformed`] if the component is empty or contains the separator.
+    pub fn validate_component(component: &str) -> Result<(), ParsePathError> {
+        if component.is_empty() || component.contains(Constant::SESSION_PATH_SEPARATOR) {
+            return Err(ParsePathError::Malformed(component.to_owned()));
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for SessionPath {
@@ -249,6 +263,16 @@ mod tests {
     fn session_path_rejects_malformed_strings() {
         for bad in ["", "a", "a/b", "a/b/c/d", "a//c", "/b/c", "a/b/"] {
             assert!(bad.parse::<SessionPath>().is_err(), "expected `{bad}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn session_path_component_validation_rejects_empty_and_separators() {
+        for good in ["aaron", "sno-box", "repo.name", "a_b"] {
+            assert!(SessionPath::validate_component(good).is_ok(), "expected `{good}` to be accepted");
+        }
+        for bad in ["", "a/b", "/", "a/", "/b"] {
+            assert!(SessionPath::validate_component(bad).is_err(), "expected `{bad}` to be rejected");
         }
     }
 

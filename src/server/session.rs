@@ -144,6 +144,10 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
                 let _ = outbound.send(err(e.into()));
                 return None;
             }
+            // Reject an empty or `/`-bearing username / machine name before persisting it (T-006).
+            if !accept_component(outbound, "username", &username) || !accept_component(outbound, "machine name", &machine) {
+                return None;
+            }
             // Possession proven — only now durably claim the username and enroll the key.
             if let Err(e) = hub.register(&username, &machine, &pubkey).await {
                 let _ = outbound.send(err(e));
@@ -170,6 +174,10 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
         }
     };
 
+    // The session handle comes from the client's `Hello`; reject it if it would break the path.
+    if !accept_component(outbound, "session handle", &session) {
+        return None;
+    }
     let path = SessionPath::new(user.clone(), machine.clone(), session);
     let kill = match hub.attach(&path, &user, &machine, outbound.clone()) {
         Ok(kill) => kill,
@@ -260,6 +268,16 @@ async fn handle_frame(hub: &Arc<Hub>, ctx: &SessionCtx, outbound: &Outbound, fra
         }
     }
     ControlFlow::Continue(())
+}
+
+/// Validates one identity component (username / machine / session), emitting a wire error and
+/// returning `false` when it is empty or contains the `/` path separator (PRD-0007 T-006, §5).
+fn accept_component(outbound: &Outbound, label: &str, value: &str) -> bool {
+    if SessionPath::validate_component(value).is_ok() {
+        return true;
+    }
+    let _ = outbound.send(err(ProtocolError::MalformedFrame(format!("invalid {label}: `{value}`"))));
+    false
 }
 
 /// Wraps a wire error as an [`ProtocolMessage::Error`] frame.

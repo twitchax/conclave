@@ -379,6 +379,33 @@ async fn server_admin_bootstrap_reserved_name_rejects_wrong_key() {
 }
 
 // -----------------------------------------------------------------------------
+// PRD-0007 T-006 (identity_validation) — usernames, machine names, and session handles must not
+// be empty or contain the `/` path separator, or the `{user}/{machine}/{session}` path becomes
+// ambiguous and `from`-attribution can be spoofed (finding #9).
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_register_rejects_a_username_with_a_path_separator() {
+    let hub = hub().await;
+    let id = Identity::generate().unwrap();
+    let mut client = Client::connect(&hub);
+    let response = client.register(&id, "aa/ron", "workstation", "s1").await;
+    assert!(matches!(response, ProtocolMessage::Error(_)), "a username with a path separator must be rejected, got {response:?}");
+}
+
+#[tokio::test]
+async fn server_identity_validation_rejects_a_session_handle_with_a_path_separator() {
+    let hub = hub().await;
+    let id = Identity::generate().unwrap();
+    let mut client = Client::connect(&hub);
+    let response = client.register(&id, "aaron", "workstation", "s/1").await;
+    assert!(
+        matches!(response, ProtocolMessage::Error(_)),
+        "a session handle with a path separator must be rejected, got {response:?}"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // uat-003 — channel create + ACL + invite redeem; private names never leak.
 // -----------------------------------------------------------------------------
 
