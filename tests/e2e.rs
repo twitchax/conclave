@@ -169,6 +169,17 @@ async fn e2e_serve_drops_a_connection_that_sends_an_oversized_frame() {
     assert!(dropped, "the server must drop a connection that sends an oversized frame");
 }
 
+#[test]
+fn e2e_serve_requires_a_data_dir_or_ephemeral() {
+    let config = TempDir::new().unwrap();
+    // Omitting both --data-dir and --ephemeral must fail loudly rather than silently run in-memory
+    // and wipe state on the next restart (PRD-0009 T-002).
+    let output = run_cli(config.path(), &["serve"]);
+    assert!(!output.status.success(), "serve without --data-dir or --ephemeral must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("data-dir"), "the error must point at --data-dir; got: {stderr}");
+}
+
 /// Reserves an ephemeral loopback port (staggered ports, DESIGN.md §17) and frees it for the server.
 fn free_loopback_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

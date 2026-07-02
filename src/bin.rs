@@ -49,6 +49,11 @@ async fn execute(cli: &Cli) -> Void {
     let dir = cli.config_dir.as_ref();
     match &cli.command {
         Command::Serve(args) => {
+            // Refuse to silently run in-memory in production: a persistent store must be explicit
+            // (--data-dir), and the ephemeral store must be opted into (PRD-0009 T-002).
+            if args.data_dir.is_none() && !args.ephemeral {
+                anyhow::bail!("`serve` requires `--data-dir <path>` for persistent storage (or `--ephemeral` for a throwaway in-memory store)");
+            }
             conclavelib::server::serve(conclavelib::server::ServerConfig {
                 bind: args.bind.clone(),
                 data_dir: args.data_dir.clone(),
@@ -540,9 +545,13 @@ struct ServeArgs {
     /// Address to bind the WSS endpoint to.
     #[arg(long, default_value = "0.0.0.0:4390")]
     bind: String,
-    /// Directory for the embedded database and server state (in-memory if omitted).
+    /// Directory for the embedded database and server state (required unless `--ephemeral`).
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Run with a throwaway in-memory store instead of `--data-dir` (tests / experiments only; all
+    /// state is lost on restart). Prevents a mis-templated deploy from silently running in-memory.
+    #[arg(long, conflicts_with = "data_dir")]
+    ephemeral: bool,
     /// Username granted server-wide admin as `user[=<pubkey-b64>]` (repeatable). Pin the key to
     /// stop the name being squatted on a fresh deploy; bare `user` is unpinned (DESIGN.md §7).
     #[arg(long = "admin", value_name = "USER[=PUBKEY]")]
