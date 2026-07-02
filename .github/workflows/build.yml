@@ -22,7 +22,10 @@ jobs:
             - uses: Swatinem/rust-cache@v2
               with:
                   cache-all-crates: "true"
-            - run: cargo binstall cargo-make --no-confirm
+            # `--force`: rust-cache can restore binstall's install manifest without the actual
+            # `~/.cargo/bin` binary, so a plain install no-ops ("already installed") and a later
+            # `cargo make` fails with "no such command: make". Force always materializes the binary.
+            - run: cargo binstall cargo-make --no-confirm --force
             - run: cargo make fmt-check
             - run: cargo make clippy
 
@@ -38,7 +41,7 @@ jobs:
             - uses: Swatinem/rust-cache@v2
               with:
                   cache-all-crates: "true"
-            - run: cargo binstall cargo-make --no-confirm
+            - run: cargo binstall cargo-make --no-confirm --force
             - run: cargo make test
 
     codecov:
@@ -54,7 +57,7 @@ jobs:
             - uses: Swatinem/rust-cache@v2
               with:
                   cache-all-crates: "true"
-            - run: cargo binstall cargo-make --no-confirm
+            - run: cargo binstall cargo-make --no-confirm --force
             - run: cargo make codecov
             - uses: codecov/codecov-action@v5
               with:
@@ -76,7 +79,7 @@ jobs:
             - uses: Swatinem/rust-cache@v2
               with:
                   cache-all-crates: "true"
-            - run: cargo binstall cargo-make --no-confirm
+            - run: cargo binstall cargo-make --no-confirm --force
             - run: cargo make build-linux
             - uses: actions/upload-artifact@v4
               with:
