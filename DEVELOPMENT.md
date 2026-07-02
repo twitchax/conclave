@@ -91,6 +91,13 @@ development-channel flag (a normally-registered MCP server has `claude/channel` 
 If the capability shape ever drifts, the mock-client tests in `src/bridge/mcp.rs` are the canonical
 record of the expected frames; update them alongside the validation.
 
+**Reconnect & presence semantics.** The bridge sends a keepalive `Ping` every 20s; the server reaps
+any session with no inbound frame for 60s, so a slept laptop or dropped wifi goes offline on its own.
+A **connection drop** is recovered automatically — the bridge reconnects with exponential backoff
+(200ms→30s) and re-subscribes its joined channels. A **bridge process death**, however, loses the
+in-memory join state: a fresh process reconnects but needs a re-`join` (DESIGN.md §16). A whisper to
+an offline/unknown session path returns a `NotFound` error to the sender (nothing is queued).
+
 ## Milestones & PRDs
 
 Work is planned as PRDs in [`.prds/`](.prds/) (M0 = PRD-0001 … M5 = PRD-0006). Reference the task

@@ -63,8 +63,9 @@ The published crate is `conclave-cli`; the installed binary is `conclave`.
 
 ## Protocol
 
-The wire protocol is defined in M1; the sequences below are the target shapes (see
-[`docs/DESIGN.md`](docs/DESIGN.md) §5, §8, §9, §12).
+Versioned frames ([`ProtocolMessage`](src/protocol.rs)) are `bincode`-encoded and length-delimited
+over a raw byte stream, or one-per-WebSocket-binary-message in production (see
+[`docs/DESIGN.md`](docs/DESIGN.md) §5, §8, §9, §13). The sequences below are what the code does.
 
 ### Auth handshake (challenge-response)
 
@@ -72,49 +73,58 @@ The wire protocol is defined in M1; the sequences below are the target shapes (s
 sequenceDiagram
     participant B as bridge
     participant S as central
-    B->>S: connect (protocol-version, pubkey, session handle)
-    S-->>B: challenge (nonce)
-    B->>S: Ed25519 signature over nonce
-    S->>S: resolve pubkey -> (user, machine)
-    S-->>B: established as user/machine/session
+    B->>S: Hello (protocol_version, session)
+    S-->>B: Challenge (nonce)
+    Note over B,S: a new user first sends Register (username, machine, pubkey)
+    B->>S: Auth (pubkey, Ed25519 signature over nonce)
+    S->>S: verify signature; resolve pubkey → (user, machine)
+    S-->>B: Established (user/machine/session)
+    S-->>B: ServerInfo (admin?) — gates the bridge's admin tools
 ```
 
 ### Channel fan-out
 
 ```mermaid
 sequenceDiagram
-    participant A as sender bridge
+    participant A as sender
     participant S as central
-    participant M1 as member bridge
-    participant M2 as member bridge
-    A->>S: send(server, channel, body)
-    S->>M1: channel event (from = full path)
-    S->>M2: channel event (from = full path)
+    participant M1 as member
+    participant M2 as member
+    A->>S: ChannelMsg (channel, body)
+    Note over S: server stamps `from`, checks membership, excludes the sender
+    S-->>M1: ChannelMsg (from = full path)
+    S-->>M2: ChannelMsg (from = full path)
 ```
 
 ### Whisper (single-session direct message)
 
 ```mermaid
 sequenceDiagram
-    participant A as sender bridge
+    participant A as sender
     participant S as central
     participant T as target session
-    A->>S: whisper(server, target-path, body)
-    S->>T: whisper event (from = full path)
+    A->>S: Whisper (target-path, body)
+    alt target online
+        S-->>T: Whisper (from = full path)
+    else offline / unknown
+        S-->>A: Error (NotFound)
+    end
 ```
 
-### Permission relay
+### Inbound injection + permission relay (bridge ↔ Claude Code)
 
 ```mermaid
 sequenceDiagram
-    participant P as peer
+    participant S as central
     participant B as your bridge
-    participant H as human
-    P->>B: inbound message
-    B->>B: resolve (server, channel) level; drop if mute
-    B->>H: relay permission request (if approval gated)
-    H-->>B: verdict
-    B->>B: inject with the level's surrounding prompt
+    participant CC as Claude Code
+    S-->>B: ChannelMsg / Whisper
+    B->>B: resolve (server, channel) level — drop if mute
+    B-->>CC: notifications/claude/channel (framed <channel>/<whisper>, untrusted)
+    CC-->>B: permission_request (dangerous tool call)
+    B-->>CC: notifications/claude/channel (relayed for approval)
+    CC->>B: submit_permission tool → verdict
+    B-->>CC: notifications/claude/channel/permission (allow/deny)
 ```
 
 ## Development

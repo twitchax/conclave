@@ -198,6 +198,44 @@ fn bridge_perm_send_is_allowed_at_converse() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// uat-003 — live per-(server, channel) permission override (no reconnect).
+// -----------------------------------------------------------------------------
+
+#[test]
+fn perm_live_set_perm_applies_without_reconnect() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    // Default notify → inbound injected read-only.
+    harness.core.handle_inbound("s1", channel_msg("ops", "one"));
+    assert_eq!(harness.injections.lock().unwrap().last().unwrap().level, PermissionLevel::Notify);
+
+    // Bump to converse live via set_perm — the very next inbound resolves at converse.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(1),
+        name: "set_perm".to_owned(),
+        args: json!({ "channel": "ops", "level": "converse" }),
+    });
+    harness.core.handle_inbound("s1", channel_msg("ops", "two"));
+    assert_eq!(harness.injections.lock().unwrap().last().unwrap().level, PermissionLevel::Converse);
+
+    // Dropping to mute live suppresses delivery entirely.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(2),
+        name: "set_perm".to_owned(),
+        args: json!({ "channel": "ops", "level": "mute" }),
+    });
+    let before = harness.injections.lock().unwrap().len();
+    harness.core.handle_inbound("s1", channel_msg("ops", "three"));
+    assert_eq!(harness.injections.lock().unwrap().len(), before, "a live mute must drop delivery");
+}
+
+#[test]
+fn perm_live_set_perm_is_always_offered() {
+    let harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    assert!(harness.core.tools().iter().any(|t| t.name == "set_perm"), "set_perm must always be available");
+}
+
 #[test]
 fn bridge_perm_emit_tools_are_gated_by_converse() {
     let harness = harness(make_config(PermissionLevel::Notify, vec![override_for("s1", Some("ops"), PermissionLevel::Converse)]));

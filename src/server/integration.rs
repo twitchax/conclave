@@ -387,6 +387,59 @@ async fn server_channel_private_names_do_not_leak() {
 }
 
 // -----------------------------------------------------------------------------
+// uat-002 (M5) — visibility tiers end-to-end.
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_visibility_unlisted_is_joinable_by_name_but_not_listed() {
+    let hub = hub().await;
+    let owner = Identity::generate().unwrap();
+    let outsider = Identity::generate().unwrap();
+
+    let mut a = Client::connect(&hub);
+    established_path(a.register(&owner, "aaron", "wa", "sa").await);
+    a.admin(AdminOp::CreateChannel {
+        name: "secret-link".to_owned(),
+        visibility: Visibility::Unlisted,
+    })
+    .await;
+
+    // A non-member who knows the exact name can join an unlisted channel...
+    let mut b = Client::connect(&hub);
+    let bpath = established_path(b.register(&outsider, "david", "wd", "sb").await);
+    assert!(matches!(b.join("secret-link", None).await, ProtocolMessage::Joined { .. }), "unlisted must be joinable by name");
+    assert!(hub.subscribers("secret-link").contains(&bpath));
+
+    // ...but it never appears in discovery.
+    b.send(ProtocolMessage::ListChannels).await;
+    assert_eq!(sorted_channel_names(b.recv().await), Vec::<String>::new(), "unlisted must not be listed in discovery");
+}
+
+#[tokio::test]
+async fn server_visibility_private_is_hidden_and_gated() {
+    let hub = hub().await;
+    let owner = Identity::generate().unwrap();
+    let outsider = Identity::generate().unwrap();
+
+    let mut a = Client::connect(&hub);
+    established_path(a.register(&owner, "aaron", "wa", "sa").await);
+    a.admin(AdminOp::CreateChannel {
+        name: "ops".to_owned(),
+        visibility: Visibility::Private,
+    })
+    .await;
+
+    let mut b = Client::connect(&hub);
+    established_path(b.register(&outsider, "david", "wd", "sb").await);
+
+    // Private is not joinable without an ACL entry or token...
+    assert!(is_unauthorized(&b.join("ops", None).await), "private join without a token must be denied");
+    // ...and never appears in discovery for a non-member.
+    b.send(ProtocolMessage::ListChannels).await;
+    assert_eq!(sorted_channel_names(b.recv().await), Vec::<String>::new(), "private must not leak into discovery");
+}
+
+// -----------------------------------------------------------------------------
 // uat-004 — fan-out: channel message to all subscribers; whisper to exactly one.
 // -----------------------------------------------------------------------------
 

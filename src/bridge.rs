@@ -211,6 +211,7 @@ impl BridgeCore {
             "list_channels" => self.tool_list(id, args),
             "who" => self.tool_who(id, args),
             "submit_permission" => self.tool_submit_permission(id, args),
+            "set_perm" => self.tool_set_perm(id, args),
             "create_channel" => self.tool_create_channel(id, args),
             "delete_channel" => self.tool_delete_channel(id, args),
             "set_visibility" => self.tool_set_visibility(id, args),
@@ -367,7 +368,7 @@ impl BridgeCore {
 
         if let Some(perm) = arg_str(args, "perm") {
             match perm.parse::<PermissionLevel>() {
-                Ok(level) => self.set_override(&server, channel, level),
+                Ok(level) => self.set_scope_override(&server, Some(channel.to_owned()), level),
                 Err(err) => return self.send_mcp(mcp::tool_error_result(id, &err.to_string())),
             }
         }
@@ -462,6 +463,28 @@ impl BridgeCore {
         self.send_mcp(mcp::tool_text_result(id, &format!("permission verdict `{behavior}` sent")));
     }
 
+    /// Changes the local autonomy level live (no reconnect); it applies to the next inbound message.
+    fn tool_set_perm(&mut self, id: &Value, args: &Value) {
+        let Some(level) = arg_str(args, "level").and_then(|level| level.parse::<PermissionLevel>().ok()) else {
+            return self.send_mcp(mcp::tool_error_result(id, "`level` must be mute, notify, converse, or act"));
+        };
+        let whisper = args.get("whisper").and_then(Value::as_bool).unwrap_or(false);
+        let channel = arg_str(args, "channel");
+
+        // Channel / whisper scopes are per-server; with neither, set the machine-wide default.
+        if channel.is_some() || whisper {
+            let server = match self.resolve_server(id, args) {
+                Ok(server) => server,
+                Err(error) => return self.send_mcp(error),
+            };
+            let scope = if whisper { None } else { channel.map(str::to_owned) };
+            self.set_scope_override(&server, scope, level);
+        } else {
+            self.config.default_permission = level;
+        }
+        self.send_mcp(mcp::tool_text_result(id, "permission updated"));
+    }
+
     /// Relays a Claude Code permission request to the local session (DESIGN.md §12/§14). The verdict
     /// is returned by the `submit_permission` tool.
     fn relay_permission(&self, request_id: &str, tool_name: &str, description: &str) {
@@ -543,7 +566,7 @@ impl BridgeCore {
     // -----------------------------------------------------------------------
 
     fn tools(&self) -> Vec<Tool> {
-        let mut tools = vec![join_channel_tool(), list_channels_tool(), who_tool(), submit_permission_tool()];
+        let mut tools = vec![join_channel_tool(), list_channels_tool(), who_tool(), submit_permission_tool(), set_perm_tool()];
         if self.any_emit_allowed() {
             tools.push(send_channel_tool());
             tools.push(whisper_tool());
@@ -593,11 +616,13 @@ impl BridgeCore {
         )
     }
 
-    fn set_override(&mut self, server: &str, channel: &str, level: PermissionLevel) {
-        self.config.overrides.retain(|o| !(o.server == server && o.channel.as_deref() == Some(channel)));
+    /// Sets a local permission override for a `(server, scope)`, replacing any prior one. `channel`
+    /// is `Some(name)` for a channel scope or `None` for the whisper scope.
+    fn set_scope_override(&mut self, server: &str, channel: Option<String>, level: PermissionLevel) {
+        self.config.overrides.retain(|o| !(o.server == server && o.channel == channel));
         self.config.overrides.push(PermissionOverride {
             server: server.to_owned(),
-            channel: Some(channel.to_owned()),
+            channel,
             level,
         });
     }
@@ -724,6 +749,23 @@ fn whisper_tool() -> Tool {
                 "text": { "type": "string", "description": "The message text." }
             },
             "required": ["target", "text"]
+        }),
+    }
+}
+
+fn set_perm_tool() -> Tool {
+    Tool {
+        name: "set_perm",
+        description: "Set your autonomy level live (mute/notify/converse/act) for a channel, the whisper scope, or the machine default. Takes effect on the next inbound message — no reconnect.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "Server URL (optional if only one is connected)." },
+                "channel": { "type": "string", "description": "Channel to scope to (omit with `whisper` for the whisper scope, or omit both for the machine default)." },
+                "whisper": { "type": "boolean", "description": "Apply to the whisper scope instead of a channel." },
+                "level": { "type": "string", "enum": ["mute", "notify", "converse", "act"] }
+            },
+            "required": ["level"]
         }),
     }
 }

@@ -310,8 +310,20 @@ struct Bridge {
 
 impl Bridge {
     fn spawn(config_dir: &Path, url: &str, session: &str) -> Self {
-        let mut child = tokio::process::Command::new(CONCLAVE_BIN)
-            .args(["bridge", "--config-dir", config_dir.to_str().unwrap(), "--server", url, "--as", session])
+        let mut command = tokio::process::Command::new(CONCLAVE_BIN);
+        command.args(["bridge", "--config-dir", config_dir.to_str().unwrap(), "--server", url, "--as", session]);
+        Self::from_command(command)
+    }
+
+    /// Spawns a bridge that connects to *all* servers in its config (multi-home).
+    fn spawn_all(config_dir: &Path, session: &str) -> Self {
+        let mut command = tokio::process::Command::new(CONCLAVE_BIN);
+        command.args(["bridge", "--config-dir", config_dir.to_str().unwrap(), "--as", session]);
+        Self::from_command(command)
+    }
+
+    fn from_command(mut command: tokio::process::Command) -> Self {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -527,4 +539,97 @@ async fn e2e_join_skill_join_with_perm_connects_subscribes_and_emits() {
         Some(true),
         "converse perm from --perm must permit send: {sent}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_multihome_routes_to_the_correct_server_and_target() {
+    let addr_a = free_loopback_addr();
+    let addr_b = free_loopback_addr();
+    let url_a = format!("ws://{addr_a}/");
+    let url_b = format!("ws://{addr_b}/");
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let _server_a = spawn_server(addr_a, dir_a.path(), &[]);
+    let _server_b = spawn_server(addr_b, dir_b.path(), &[]);
+    wait_for_listener(addr_a).await;
+    wait_for_listener(addr_b).await;
+
+    // Aaron is enrolled on BOTH servers (one key, two registrations) and owns a channel on each.
+    let aaron_id = Identity::generate().unwrap();
+    let aaron_dir = TempDir::new().unwrap();
+    save_identity(aaron_dir.path(), &aaron_id).unwrap();
+    save_config(
+        aaron_dir.path(),
+        &Config {
+            // Converse everywhere so aaron may emit to channels and whisper (its own scope, §9).
+            default_permission: PermissionLevel::Converse,
+            servers: vec![
+                ServerRegistration {
+                    url: url_a.clone(),
+                    username: "aaron".to_owned(),
+                    machine: "workstation".to_owned(),
+                },
+                ServerRegistration {
+                    url: url_b.clone(),
+                    username: "aaron".to_owned(),
+                    machine: "workstation".to_owned(),
+                },
+            ],
+            overrides: vec![],
+        },
+    )
+    .unwrap();
+    for (addr, channel) in [(addr_a, "a-chan"), (addr_b, "b-chan")] {
+        let mut ws = ws_connect(addr).await;
+        ws_register(&mut ws, &aaron_id, "aaron", "workstation", "setup").await;
+        ws_send(
+            &mut ws,
+            &ProtocolMessage::Admin(AdminOp::CreateChannel {
+                name: channel.to_owned(),
+                visibility: Visibility::Public,
+            }),
+        )
+        .await;
+        assert!(matches!(ws_recv(&mut ws).await, ProtocolMessage::Ack { .. }));
+    }
+
+    // Listeners: david on server A (joined a-chan), evan on server B (joined b-chan).
+    let mut david = ws_connect(addr_a).await;
+    let david_path = ws_register(&mut david, &Identity::generate().unwrap(), "david", "desktop", "dsession").await;
+    join(&mut david, "a-chan").await;
+    let mut evan = ws_connect(addr_b).await;
+    ws_register(&mut evan, &Identity::generate().unwrap(), "evan", "laptop", "esession").await;
+    join(&mut evan, "b-chan").await;
+
+    // One bridge, both servers; join a channel on each.
+    let mut aaron = Bridge::spawn_all(aaron_dir.path(), "multi");
+    aaron.initialize().await;
+    aaron.call(1, "join_channel", json!({ "server": url_a, "channel": "a-chan" })).await;
+    aaron.call(2, "join_channel", json!({ "server": url_b, "channel": "b-chan" })).await;
+
+    // A message to (A, a-chan) reaches david; a message to (B, b-chan) reaches evan.
+    aaron.call(3, "send_channel", json!({ "server": url_a, "channel": "a-chan", "text": "for A" })).await;
+    aaron.call(4, "send_channel", json!({ "server": url_b, "channel": "b-chan", "text": "for B" })).await;
+
+    match ws_recv(&mut david).await {
+        ProtocolMessage::ChannelMsg { channel, payload, .. } => {
+            assert_eq!(channel, "a-chan");
+            assert_eq!(payload, Payload::Plain("for A".to_owned()));
+        }
+        other => panic!("david (server A) expected the a-chan message, got {other:?}"),
+    }
+    match ws_recv(&mut evan).await {
+        ProtocolMessage::ChannelMsg { channel, payload, .. } => {
+            assert_eq!(channel, "b-chan");
+            assert_eq!(payload, Payload::Plain("for B".to_owned()));
+        }
+        other => panic!("evan (server B) expected the b-chan message, got {other:?}"),
+    }
+
+    // A whisper to a (server, target-path) reaches exactly that session on that server.
+    aaron.call(5, "whisper", json!({ "server": url_a, "target": david_path.to_string(), "text": "psst A" })).await;
+    match ws_recv(&mut david).await {
+        ProtocolMessage::Whisper { payload, .. } => assert_eq!(payload, Payload::Plain("psst A".to_owned())),
+        other => panic!("david expected a whisper, got {other:?}"),
+    }
 }

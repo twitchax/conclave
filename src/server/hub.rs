@@ -621,3 +621,81 @@ fn parse_visibility(token: &str) -> Visibility {
 fn is_expired(rfc3339: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(rfc3339).map_or(true, |dt| dt.with_timezone(&chrono::Utc) <= chrono::Utc::now())
 }
+
+#[cfg(test)]
+mod tests {
+    // Tests relax `unwrap_used` (house convention; DESIGN.md §22).
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::store::Store;
+
+    async fn hub_with_private_channel(token_uses: Option<i64>, expires_at: Option<String>) -> Arc<Hub> {
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        store.create_invite("ops", "tok", token_uses, expires_at, "aaron").await.unwrap();
+        Hub::new(store, HashSet::new())
+    }
+
+    fn attach_session(hub: &Arc<Hub>, user: &str) -> SessionPath {
+        let path = SessionPath::new(user, "machine", "session");
+        // The outbound receiver is unused (these tests don't fan out); attach only needs the sender.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        hub.attach(&path, user, "machine", tx).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn invite_single_use_is_consumed_after_one_redeem() {
+        let hub = hub_with_private_channel(Some(1), None).await;
+
+        let david = attach_session(&hub, "david");
+        hub.join("david", &david, "ops", Some("tok")).await.unwrap();
+        assert!(hub.subscribers("ops").contains(&david), "redeeming a valid invite must subscribe + add to the ACL");
+
+        // The spent single-use token cannot be redeemed again.
+        let carol = attach_session(&hub, "carol");
+        assert!(hub.join("carol", &carol, "ops", Some("tok")).await.is_err(), "a spent single-use invite must be refused");
+    }
+
+    #[tokio::test]
+    async fn invite_multi_use_allows_several_then_exhausts() {
+        let hub = hub_with_private_channel(Some(2), None).await;
+
+        for user in ["david", "carol"] {
+            let path = attach_session(&hub, user);
+            hub.join(user, &path, "ops", Some("tok")).await.unwrap();
+        }
+        // The third redemption exhausts the token.
+        let evan = attach_session(&hub, "evan");
+        assert!(hub.join("evan", &evan, "ops", Some("tok")).await.is_err(), "an exhausted invite must be refused");
+    }
+
+    #[tokio::test]
+    async fn invite_expiry_refuses_an_expired_token() {
+        let hub = hub_with_private_channel(None, Some("2000-01-01T00:00:00+00:00".to_owned())).await;
+
+        let david = attach_session(&hub, "david");
+        assert!(hub.join("david", &david, "ops", Some("tok")).await.is_err(), "an expired token must be refused");
+    }
+
+    #[tokio::test]
+    async fn invite_revoked_token_is_refused() {
+        let hub = hub_with_private_channel(None, None).await;
+
+        // The channel admin revokes the token.
+        hub.admin("aaron", AdminOp::InviteRevoke { token: "tok".to_owned() }).await.unwrap();
+
+        let david = attach_session(&hub, "david");
+        assert!(hub.join("david", &david, "ops", Some("tok")).await.is_err(), "a revoked token must be refused");
+    }
+
+    #[tokio::test]
+    async fn invite_wrong_channel_token_is_refused() {
+        let hub = hub_with_private_channel(None, None).await;
+        // A second private channel with no invite of its own.
+        // (The `tok` invite is bound to `ops`, so it must not open `secret`.)
+        let david = attach_session(&hub, "david");
+        assert!(hub.join("david", &david, "ops", Some("nope")).await.is_err(), "an unknown token must be refused");
+    }
+}
