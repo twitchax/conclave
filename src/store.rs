@@ -33,6 +33,7 @@ DEFINE INDEX IF NOT EXISTS machine_pubkey ON machine FIELDS pubkey UNIQUE;
 DEFINE INDEX IF NOT EXISTS machine_user_name ON machine FIELDS user, name UNIQUE;
 DEFINE INDEX IF NOT EXISTS channel_name ON channel FIELDS name UNIQUE;
 DEFINE INDEX IF NOT EXISTS invite_token ON invite FIELDS token UNIQUE;
+DEFINE INDEX IF NOT EXISTS membership_channel_user ON membership FIELDS channel, user UNIQUE;
 ";
 
 /// A registered account (`username` unique per server, DESIGN.md §15).
@@ -58,15 +59,15 @@ pub struct MachineRecord {
     pub added_at: String,
 }
 
-/// A channel (`name` unique, DESIGN.md §6, §15).
+/// A channel (`name` unique, DESIGN.md §6, §15). Membership (the ACL) is normalized into the
+/// `membership` table rather than an embedded array, so concurrent joins insert distinct records
+/// instead of contending on one row (PRD-0007 T-003).
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ChannelRecord {
     /// The channel name.
     pub name: String,
     /// The visibility tier token (see [`Visibility::as_str`]).
     pub visibility: String,
-    /// The user-level access-control list.
-    pub acl: Vec<String>,
     /// The creating (and administering) user.
     pub created_by: String,
     /// RFC 3339 creation timestamp.
@@ -123,12 +124,6 @@ struct ByUserAndName {
 }
 
 #[derive(SurrealValue)]
-struct SetAcl {
-    name: String,
-    acl: Vec<String>,
-}
-
-#[derive(SurrealValue)]
 struct SetVisibility {
     name: String,
     visibility: String,
@@ -145,6 +140,30 @@ struct SetUses {
     // `token` is a protected variable name in SurrealQL, so bind under `tok`.
     tok: String,
     uses: i64,
+}
+
+#[derive(SurrealValue)]
+struct Membership {
+    channel: String,
+    user: String,
+}
+
+#[derive(SurrealValue)]
+struct ByChannel {
+    channel: String,
+}
+
+/// A bounded cap on optimistic-concurrency retries: high enough to clear realistic contention on a
+/// single channel record, low enough that a genuinely stuck write still surfaces (DESIGN.md §15).
+const MAX_WRITE_ATTEMPTS: usize = 64;
+
+/// Whether a `SurrealDB` error is an optimistic-concurrency write-write conflict (`SurrealKV`
+/// surfaces `TransactionWriteConflict`; `SurrealDB` maps it to `TransactionConflict`, both rendering
+/// with "conflict"). These are expected under concurrent load and must be retried per `SurrealDB`'s
+/// optimistic-concurrency contract — the loser of a same-key write re-applies its statement — rather
+/// than serialized behind an application lock (DESIGN.md §15).
+fn is_write_conflict(err: &surrealdb::Error) -> bool {
+    err.to_string().to_lowercase().contains("conflict")
 }
 
 /// The embedded store: a thin typed repository over an embedded `SurrealDB` instance.
@@ -290,11 +309,12 @@ impl Store {
         let record = ChannelRecord {
             name: name.to_owned(),
             visibility: visibility.as_str().to_owned(),
-            acl: vec![created_by.to_owned()],
             created_by: created_by.to_owned(),
             created_at: now_rfc3339(),
         };
         self.insert("channel", record.clone()).await?;
+        // The creator is the channel's first member (it also administers via `created_by`).
+        self.add_channel_member(name, created_by).await?;
         Ok(record)
     }
 
@@ -357,20 +377,106 @@ impl Store {
         response.take(0).context("failed to decode channel rows")
     }
 
-    /// Replaces a channel's access-control list (e.g. after an ACL add / invite redeem).
+    /// Adds `user` to a channel's membership (its ACL), idempotently. Each membership is its own
+    /// record under the unique `(channel, user)` index, so concurrent adds of different users write
+    /// distinct keys and never contend on a shared row (PRD-0007 T-003); a conflict on the same pair
+    /// is retried per `SurrealDB`'s optimistic-concurrency contract.
     ///
     /// # Errors
     ///
-    /// Returns an error if the update fails.
-    pub async fn set_channel_acl(&self, name: &str, acl: &[String]) -> Void {
-        self.db
-            .query("UPDATE channel SET acl = $acl WHERE name = $name")
-            .bind(SetAcl { name: name.to_owned(), acl: acl.to_vec() })
+    /// Returns an error if the write keeps conflicting past the retry cap or otherwise fails.
+    pub async fn add_channel_member(&self, channel: &str, user: &str) -> Void {
+        for attempt in 0..MAX_WRITE_ATTEMPTS {
+            let outcome = self
+                .db
+                .query("INSERT INTO membership { channel: $channel, user: $user } ON DUPLICATE KEY UPDATE channel = $channel")
+                .bind(Membership {
+                    channel: channel.to_owned(),
+                    user: user.to_owned(),
+                })
+                .await
+                .and_then(surrealdb::IndexedResults::check);
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(e) if is_write_conflict(&e) && attempt + 1 < MAX_WRITE_ATTEMPTS => tokio::task::yield_now().await,
+                Err(e) => return Err(anyhow::Error::new(e).context("failed to add channel member")),
+            }
+        }
+        anyhow::bail!("adding a channel member exhausted {MAX_WRITE_ATTEMPTS} write-conflict retries")
+    }
+
+    /// Removes `user` from a channel's membership; idempotent (removing a non-member is a no-op).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete keeps conflicting past the retry cap or otherwise fails.
+    pub async fn remove_channel_member(&self, channel: &str, user: &str) -> Void {
+        for attempt in 0..MAX_WRITE_ATTEMPTS {
+            let outcome = self
+                .db
+                .query("DELETE membership WHERE channel = $channel AND user = $user")
+                .bind(Membership {
+                    channel: channel.to_owned(),
+                    user: user.to_owned(),
+                })
+                .await
+                .and_then(surrealdb::IndexedResults::check);
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(e) if is_write_conflict(&e) && attempt + 1 < MAX_WRITE_ATTEMPTS => tokio::task::yield_now().await,
+                Err(e) => return Err(anyhow::Error::new(e).context("failed to remove channel member")),
+            }
+        }
+        anyhow::bail!("removing a channel member exhausted {MAX_WRITE_ATTEMPTS} write-conflict retries")
+    }
+
+    /// Whether `user` is a member of `channel`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn is_channel_member(&self, channel: &str, user: &str) -> Res<bool> {
+        let mut response = self
+            .db
+            .query("SELECT VALUE user FROM membership WHERE channel = $channel AND user = $user")
+            .bind(Membership {
+                channel: channel.to_owned(),
+                user: user.to_owned(),
+            })
             .await
-            .context("failed to update channel acl")?
-            .check()
-            .context("channel acl update reported an error")?;
-        Ok(())
+            .context("failed to query membership")?;
+        let rows: Vec<String> = response.take(0).context("failed to decode membership rows")?;
+        Ok(!rows.is_empty())
+    }
+
+    /// The channels `user` is a member of (for discovery gating, DESIGN.md §6).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_user_memberships(&self, user: &str) -> Res<Vec<String>> {
+        let mut response = self
+            .db
+            .query("SELECT VALUE channel FROM membership WHERE user = $user")
+            .bind(ByUser { user: user.to_owned() })
+            .await
+            .context("failed to list user memberships")?;
+        response.take(0).context("failed to decode membership channels")
+    }
+
+    /// The members of a channel (its ACL users).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_channel_members(&self, channel: &str) -> Res<Vec<String>> {
+        let mut response = self
+            .db
+            .query("SELECT VALUE user FROM membership WHERE channel = $channel")
+            .bind(ByChannel { channel: channel.to_owned() })
+            .await
+            .context("failed to list channel members")?;
+        response.take(0).context("failed to decode membership users")
     }
 
     /// Changes a channel's visibility tier.
@@ -405,6 +511,14 @@ impl Store {
             .context("failed to rename channel")?
             .check()
             .context("channel rename reported an error")?;
+        // Keep memberships attached to the renamed channel.
+        self.db
+            .query("UPDATE membership SET channel = $new WHERE channel = $old")
+            .bind(Rename { old: old.to_owned(), new: new.to_owned() })
+            .await
+            .context("failed to migrate channel memberships")?
+            .check()
+            .context("membership rename reported an error")?;
         Ok(())
     }
 
@@ -421,6 +535,14 @@ impl Store {
             .context("failed to delete channel")?
             .check()
             .context("channel delete reported an error")?;
+        // Drop the channel's memberships so a future same-named channel does not inherit them.
+        self.db
+            .query("DELETE membership WHERE channel = $channel")
+            .bind(ByChannel { channel: name.to_owned() })
+            .await
+            .context("failed to delete channel memberships")?
+            .check()
+            .context("membership delete reported an error")?;
         Ok(())
     }
 
@@ -441,6 +563,45 @@ impl Store {
             .check()
             .context("invite uses update reported an error")?;
         Ok(())
+    }
+
+    /// Atomically consumes one redemption of a limited-use invite: decrements `uses_remaining` only
+    /// while it is positive, returning whether a use was claimed. The guarded single-statement update
+    /// (retried on an optimistic-concurrency conflict) makes concurrent redeemers of the last use
+    /// mutually exclusive, so a single-use token admits exactly one (PRD-0007 T-003). The caller
+    /// handles unlimited (`None`) tokens and expiry; an exhausted token is deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update keeps conflicting past the retry cap or otherwise fails.
+    pub async fn try_consume_invite_use(&self, token: &str) -> Res<bool> {
+        for attempt in 0..MAX_WRITE_ATTEMPTS {
+            let outcome = self
+                .db
+                .query("UPDATE invite SET uses_remaining = uses_remaining - 1 WHERE token = $tok AND uses_remaining > 0 RETURN VALUE uses_remaining")
+                .bind(ByToken { tok: token.to_owned() })
+                .await
+                .and_then(surrealdb::IndexedResults::check);
+            match outcome {
+                Ok(mut response) => {
+                    let remaining: Vec<i64> = response.take(0).context("failed to decode invite uses")?;
+                    return match remaining.into_iter().next() {
+                        // No positive-use row matched — the token was already spent (or removed).
+                        None => Ok(false),
+                        // This redemption took the last use; delete the spent token.
+                        Some(0) => {
+                            self.delete_invite(token).await?;
+                            Ok(true)
+                        }
+                        // A use was consumed with more remaining.
+                        Some(_) => Ok(true),
+                    };
+                }
+                Err(e) if is_write_conflict(&e) && attempt + 1 < MAX_WRITE_ATTEMPTS => tokio::task::yield_now().await,
+                Err(e) => return Err(anyhow::Error::new(e).context("failed to consume invite use")),
+            }
+        }
+        anyhow::bail!("consuming an invite use exhausted {MAX_WRITE_ATTEMPTS} write-conflict retries")
     }
 
     /// Deletes an invite token (on revoke or when an exhausted token is redeemed).
@@ -573,13 +734,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_acl_can_be_replaced() {
+    async fn channel_membership_add_remove_and_list() {
         let store = store().await;
         store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        // The creator is seeded as the first member.
+        assert!(store.is_channel_member("ops", "aaron").await.unwrap());
 
-        store.set_channel_acl("ops", &["aaron".to_owned(), "david".to_owned()]).await.unwrap();
+        store.add_channel_member("ops", "david").await.unwrap();
+        // Idempotent: re-adding an existing member is a no-op, not a duplicate or an error.
+        store.add_channel_member("ops", "david").await.unwrap();
+        assert!(store.is_channel_member("ops", "david").await.unwrap());
 
-        assert_eq!(store.get_channel("ops").await.unwrap().unwrap().acl, vec!["aaron".to_owned(), "david".to_owned()]);
+        let mut members = store.list_channel_members("ops").await.unwrap();
+        members.sort();
+        assert_eq!(members, vec!["aaron".to_owned(), "david".to_owned()]);
+        assert_eq!(store.list_user_memberships("david").await.unwrap(), vec!["ops".to_owned()]);
+
+        store.remove_channel_member("ops", "david").await.unwrap();
+        assert!(!store.is_channel_member("ops", "david").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn channel_memberships_follow_delete_and_rename() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        store.add_channel_member("ops", "david").await.unwrap();
+
+        // Rename migrates memberships to the new channel name.
+        store.rename_channel("ops", "operations").await.unwrap();
+        assert!(store.is_channel_member("operations", "david").await.unwrap());
+        assert!(!store.is_channel_member("ops", "david").await.unwrap());
+
+        // Deleting a channel drops its memberships, so a future same-named channel cannot inherit them.
+        store.delete_channel("operations").await.unwrap();
+        assert!(store.list_channel_members("operations").await.unwrap().is_empty());
     }
 
     #[tokio::test]

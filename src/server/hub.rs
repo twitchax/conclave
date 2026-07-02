@@ -209,7 +209,7 @@ impl Hub {
 
     /// Joins a channel — authorized by visibility, ACL membership, or a redeemed invite token (§6).
     pub(crate) async fn join(&self, user: &str, path: &SessionPath, channel: &str, token: Option<&str>) -> Result<(), ProtocolError> {
-        let mut record = self
+        let record = self
             .store
             .get_channel(channel)
             .await
@@ -220,7 +220,7 @@ impl Hub {
             return Err(AclError::ChannelPrivate(channel.to_owned()).into());
         }
 
-        let already_member = record.acl.iter().any(|u| u == user);
+        let already_member = self.store.is_channel_member(channel, user).await.map_err(internal)?;
         if !already_member {
             match parse_visibility(&record.visibility) {
                 // Public and unlisted are open to anyone who reaches them (unlisted needs the name).
@@ -229,8 +229,7 @@ impl Hub {
                 Visibility::Private => {
                     let token = token.ok_or_else(|| ProtocolError::from(AclError::ChannelPrivate(channel.to_owned())))?;
                     self.redeem_invite(channel, token).await?;
-                    record.acl.push(user.to_owned());
-                    self.store.set_channel_acl(channel, &record.acl).await.map_err(internal)?;
+                    self.store.add_channel_member(channel, user).await.map_err(internal)?;
                 }
             }
         }
@@ -248,11 +247,12 @@ impl Hub {
     /// belong to. Private and unlisted names never leak to non-members (DESIGN.md §6).
     pub(crate) async fn list_channels(&self, user: &str) -> Result<Vec<ChannelInfo>, ProtocolError> {
         let channels = self.store.list_channels().await.map_err(internal)?;
+        let memberships: HashSet<String> = self.store.list_user_memberships(user).await.map_err(internal)?.into_iter().collect();
         let infos = channels
             .into_iter()
             .filter_map(|c| {
                 let visibility = parse_visibility(&c.visibility);
-                let member = c.acl.iter().any(|u| u == user);
+                let member = memberships.contains(&c.name);
                 let visible = matches!(visibility, Visibility::Public) || member;
                 visible.then_some(ChannelInfo { name: c.name, visibility, member })
             })
@@ -266,13 +266,14 @@ impl Hub {
             return Ok(self.present_paths());
         };
 
-        let record = self
-            .store
+        // The channel must exist; a non-member is refused (the NotFound/NotMember split is an
+        // information leak revisited in T-007).
+        self.store
             .get_channel(channel)
             .await
             .map_err(internal)?
             .ok_or_else(|| ProtocolError::from(AclError::ChannelNotFound(channel.to_owned())))?;
-        if !record.acl.iter().any(|u| u == user) && !self.is_admin(user) {
+        if !self.store.is_channel_member(channel, user).await.map_err(internal)? && !self.is_admin(user) {
             return Err(AclError::NotMember(channel.to_owned()).into());
         }
 
@@ -352,18 +353,14 @@ impl Hub {
                 Ok(ack(name))
             }
             AdminOp::AclAdd { channel, user: target } => {
-                let mut record = self.authorize_channel_admin(&channel, user).await?;
-                if !record.acl.iter().any(|u| u == &target) {
-                    record.acl.push(target.clone());
-                    self.store.set_channel_acl(&channel, &record.acl).await.map_err(internal)?;
-                }
+                self.authorize_channel_admin(&channel, user).await?;
+                self.store.add_channel_member(&channel, &target).await.map_err(internal)?;
                 self.remove_ban(&channel, &target);
                 Ok(ack(target))
             }
             AdminOp::AclRemove { channel, user: target } => {
-                let mut record = self.authorize_channel_admin(&channel, user).await?;
-                record.acl.retain(|u| u != &target);
-                self.store.set_channel_acl(&channel, &record.acl).await.map_err(internal)?;
+                self.authorize_channel_admin(&channel, user).await?;
+                self.store.remove_channel_member(&channel, &target).await.map_err(internal)?;
                 self.unsubscribe_user(&target, &channel);
                 Ok(ack(target))
             }
@@ -394,9 +391,8 @@ impl Hub {
                 Ok(ack(target))
             }
             AdminOp::Ban { channel, user: target } => {
-                let mut record = self.authorize_channel_admin(&channel, user).await?;
-                record.acl.retain(|u| u != &target);
-                self.store.set_channel_acl(&channel, &record.acl).await.map_err(internal)?;
+                self.authorize_channel_admin(&channel, user).await?;
+                self.store.remove_channel_member(&channel, &target).await.map_err(internal)?;
                 self.add_ban(&channel, &target);
                 self.unsubscribe_user(&target, &channel);
                 Ok(ack(target))
@@ -455,10 +451,10 @@ impl Hub {
             return Err(AclError::ChannelPrivate(channel.to_owned()).into());
         }
 
-        match invite.uses_remaining {
-            Some(remaining) if remaining <= 1 => self.store.delete_invite(token).await.map_err(internal)?,
-            Some(remaining) => self.store.set_invite_uses(token, remaining - 1).await.map_err(internal)?,
-            None => {}
+        // Unlimited tokens (`None`) grant access without consuming a use; a limited token atomically
+        // consumes one, so concurrent redeemers of the last use are mutually exclusive (T-003).
+        if invite.uses_remaining.is_some() && !self.store.try_consume_invite_use(token).await.map_err(internal)? {
+            return Err(AclError::ChannelPrivate(channel.to_owned()).into());
         }
         Ok(())
     }
@@ -705,5 +701,51 @@ mod tests {
         // (The `tok` invite is bound to `ops`, so it must not open `secret`.)
         let david = attach_session(&hub, "david");
         assert!(hub.join("david", &david, "ops", Some("nope")).await.is_err(), "an unknown token must be refused");
+    }
+
+    // PRD-0007 T-003 — concurrent redemption must not double-spend a single-use invite, and
+    // concurrent joins must not clobber the ACL (finding #2).
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invite_single_use_admits_exactly_one_under_concurrent_redeem() {
+        const RACERS: usize = 16;
+        let hub = hub_with_private_channel(Some(1), None).await;
+
+        let mut tasks = Vec::with_capacity(RACERS);
+        for i in 0..RACERS {
+            let user = format!("user{i}");
+            let path = attach_session(&hub, &user);
+            let hub = Arc::clone(&hub);
+            tasks.push(tokio::spawn(async move { hub.join(&user, &path, "ops", Some("tok")).await.is_ok() }));
+        }
+
+        let mut admitted = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 1, "a single-use invite must admit exactly one redeemer under concurrency, admitted {admitted}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_joins_on_unlimited_invite_preserve_every_acl_entry() {
+        const JOINERS: usize = 12;
+        let hub = hub_with_private_channel(None, None).await;
+
+        let mut tasks = Vec::with_capacity(JOINERS);
+        for i in 0..JOINERS {
+            let user = format!("user{i}");
+            let path = attach_session(&hub, &user);
+            let hub = Arc::clone(&hub);
+            tasks.push(tokio::spawn(async move { hub.join(&user, &path, "ops", Some("tok")).await }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        // Membership must carry the creator plus every joiner — normalized rows, no lost writes.
+        let members = hub.store.list_channel_members("ops").await.unwrap();
+        assert_eq!(members.len(), JOINERS + 1, "concurrent joins must not lose a membership, got {members:?}");
     }
 }
