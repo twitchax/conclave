@@ -10,9 +10,14 @@
 //! machine) → `Established`. Thereafter each inbound frame refreshes the heartbeat and dispatches to
 //! the [`Hub`]; a force-drop (revocation / reaping) fires the session's kill signal.
 
-use std::{ops::ControlFlow, sync::Arc};
+use std::{ops::ControlFlow, sync::Arc, time::Duration};
 
 use tokio::sync::{Notify, mpsc};
+
+/// How long an unauthenticated connection may take to complete the handshake before it is dropped,
+/// so a silent or stalled pre-auth peer cannot hold a connection (and its buffers) open forever —
+/// pre-auth sessions are invisible to the heartbeat reaper (PRD-0007 T-008, finding #15).
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::{
     base::SessionPath,
@@ -36,8 +41,15 @@ struct SessionCtx {
 ///
 /// Returns when the transport closes, the handshake fails, or the session is force-dropped.
 pub(crate) async fn run_session(hub: Arc<Hub>, mut inbound: Inbound, outbound: Outbound) {
-    let Some(ctx) = handshake(&hub, &mut inbound, &outbound).await else {
-        return;
+    let ctx = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&hub, &mut inbound, &outbound)).await {
+        Ok(Some(ctx)) => ctx,
+        // The handshake failed and already sent its error frame.
+        Ok(None) => return,
+        // A silent / stalled pre-auth peer: drop it (finding #15).
+        Err(_elapsed) => {
+            let _ = outbound.send(err(ProtocolError::Unauthorized("handshake timed out".to_owned())));
+            return;
+        }
     };
 
     let kill = Arc::clone(&ctx.kill);

@@ -20,7 +20,11 @@ use axum::{
 };
 use tokio::{net::TcpListener, sync::mpsc};
 
-use crate::{base::Void, protocol, store::Store};
+use crate::{
+    base::{Constant, Void},
+    protocol,
+    store::Store,
+};
 
 use super::{hub::Hub, session::run_session};
 
@@ -85,7 +89,11 @@ fn spawn_reaper(hub: Arc<Hub>) {
 
 /// The WebSocket upgrade handler; every connection is dispatched to [`handle_ws`].
 async fn ws_handler(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> Response {
-    ws.on_upgrade(move |socket| handle_ws(hub, socket))
+    // Enforce the protocol's frame cap (Constant::MAX_FRAME_SIZE) instead of tungstenite's 64 MiB
+    // default, so a pre-auth peer cannot force a large buffer per message (finding #17/#19).
+    ws.max_message_size(Constant::MAX_FRAME_SIZE)
+        .max_frame_size(Constant::MAX_FRAME_SIZE)
+        .on_upgrade(move |socket| handle_ws(hub, socket))
 }
 
 /// Bridges a WebSocket to [`run_session`]: each WS binary message is one protocol frame.

@@ -138,6 +138,37 @@ async fn e2e_serve_channel_fanout_over_websocket() {
     }
 }
 
+#[tokio::test]
+async fn e2e_serve_drops_a_connection_that_sends_an_oversized_frame() {
+    let data_dir = TempDir::new().unwrap();
+    let addr = free_loopback_addr();
+
+    let _server = ServerProcess(
+        Command::new(CONCLAVE_BIN)
+            .args(["serve", "--bind", &addr.to_string(), "--data-dir", data_dir.path().to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn `conclave serve`"),
+    );
+    wait_for_listener(addr).await;
+
+    let mut ws = ws_connect(addr).await;
+    // A binary frame larger than the protocol cap (16 MiB) must be rejected by the transport rather
+    // than buffered; the server drops the connection (PRD-0007 T-008, finding #17/#19).
+    let oversized = vec![0_u8; Constant::MAX_FRAME_SIZE + 1];
+    let _ = ws.send(Message::Binary(oversized.into())).await;
+
+    let dropped = loop {
+        match ws.next().await {
+            None | Some(Ok(Message::Close(_)) | Err(_)) => break true,
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(_)) => break false,
+        }
+    };
+    assert!(dropped, "the server must drop a connection that sends an oversized frame");
+}
+
 /// Reserves an ephemeral loopback port (staggered ports, DESIGN.md §17) and frees it for the server.
 fn free_loopback_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

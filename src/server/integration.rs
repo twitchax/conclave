@@ -473,6 +473,25 @@ async fn server_who_is_open_to_a_public_channel_participant() {
 }
 
 // -----------------------------------------------------------------------------
+// PRD-0007 T-008 (handshake_timeout) — an unauthenticated connection that never completes the
+// handshake is dropped, so a silent pre-auth peer cannot hold a connection open forever (#15).
+// -----------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn server_handshake_timeout_drops_a_silent_pre_auth_connection() {
+    let hub = hub().await;
+    let mut client = Client::connect(&hub);
+
+    // Send nothing, then advance past the handshake deadline.
+    tokio::time::advance(super::session::HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+
+    assert!(
+        matches!(client.recv().await, ProtocolMessage::Error(_)),
+        "a silent pre-auth connection must be dropped with a timeout error"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // uat-003 — channel create + ACL + invite redeem; private names never leak.
 // -----------------------------------------------------------------------------
 
