@@ -82,7 +82,7 @@ sequenceDiagram
     S-->>B: Challenge (nonce)
     Note over B,S: a new user first sends Register (username, machine, pubkey)
     B->>S: Auth (pubkey, Ed25519 signature over nonce)
-    S->>S: verify signature; resolve pubkey → (user, machine)
+    S->>S: verify signature, resolve pubkey to (user, machine)
     S-->>B: Established (user/machine/session)
     S-->>B: ServerInfo (admin?) — gates the bridge's admin tools
 ```
