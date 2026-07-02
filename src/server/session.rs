@@ -129,11 +129,9 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
 
     let (user, machine) = match inbound.recv().await? {
         ProtocolMessage::Register { username, machine, pubkey } => {
-            if let Err(e) = hub.register(&username, &machine, &pubkey).await {
-                let _ = outbound.send(err(e));
-                return None;
-            }
-            // Prove possession of the just-enrolled key against the same challenge (§5.1).
+            // Prove possession of the key against the challenge BEFORE any durable write, so an
+            // aborted or forged registration cannot squat a username or enroll a key it never
+            // held (DESIGN.md §5.1). The Auth must carry the same key that is being registered.
             let ProtocolMessage::Auth { pubkey: auth_pubkey, signature } = inbound.recv().await? else {
                 let _ = outbound.send(err(ProtocolError::MalformedFrame("expected Auth after Register".to_owned())));
                 return None;
@@ -144,6 +142,11 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
             }
             if let Err(e) = identity::verify(&auth_pubkey, &nonce, &signature) {
                 let _ = outbound.send(err(e.into()));
+                return None;
+            }
+            // Possession proven — only now durably claim the username and enroll the key.
+            if let Err(e) = hub.register(&username, &machine, &pubkey).await {
+                let _ = outbound.send(err(e));
                 return None;
             }
             (username, machine)

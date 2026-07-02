@@ -280,6 +280,81 @@ async fn server_auth_refuses_revoked_key() {
 }
 
 // -----------------------------------------------------------------------------
+// PRD-0007 T-001 (register_proof) — possession is proven before any durable write.
+// An aborted registration handshake (a failed or mismatched Auth after Register) must
+// persist nothing: no squatted username, no enrolled key (DESIGN.md §5.1).
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_register_proof_bad_signature_persists_nothing() {
+    let hub = hub().await;
+    let attacker = Identity::generate().unwrap();
+
+    // An unauthenticated client claims the victim's username but fails the possession proof.
+    let mut evil = Client::connect(&hub);
+    evil.hello("s1").await;
+    let _nonce = evil.challenge().await;
+    let attacker_key = attacker.public_key().to_vec();
+    evil.send(ProtocolMessage::Register {
+        username: "aaron".to_owned(),
+        machine: "evil".to_owned(),
+        pubkey: attacker_key.clone(),
+    })
+    .await;
+    let bad_signature = attacker.sign(&[0_u8; Constant::CHALLENGE_SIZE]).unwrap().to_vec();
+    evil.send(ProtocolMessage::Auth {
+        pubkey: attacker_key,
+        signature: bad_signature,
+    })
+    .await;
+    assert!(is_unauthorized(&evil.recv().await), "a failed possession proof must be rejected");
+
+    // Nothing was persisted: the rightful owner can still claim the username with their own key...
+    let owner = Identity::generate().unwrap();
+    let mut legit = Client::connect(&hub);
+    let result = legit.register(&owner, "aaron", "workstation", "s2").await;
+    assert!(
+        matches!(result, ProtocolMessage::Established { .. }),
+        "an aborted handshake must not squat the username; got {result:?}"
+    );
+
+    // ...and the attacker's unproven key was never enrolled, so it cannot authenticate.
+    let mut replay = Client::connect(&hub);
+    assert!(is_unauthorized(&replay.authenticate(&attacker, "s3").await), "an unproven key must not have been enrolled");
+}
+
+#[tokio::test]
+async fn server_register_proof_key_mismatch_persists_nothing() {
+    let hub = hub().await;
+    let claimed = Identity::generate().unwrap();
+    let other = Identity::generate().unwrap();
+
+    // Register one key, then prove possession of a *different* key (validly signed).
+    let mut evil = Client::connect(&hub);
+    evil.hello("s1").await;
+    let nonce = evil.challenge().await;
+    evil.send(ProtocolMessage::Register {
+        username: "aaron".to_owned(),
+        machine: "evil".to_owned(),
+        pubkey: claimed.public_key().to_vec(),
+    })
+    .await;
+    let signature = other.sign(&nonce).unwrap().to_vec();
+    evil.send(ProtocolMessage::Auth {
+        pubkey: other.public_key().to_vec(),
+        signature,
+    })
+    .await;
+    assert!(is_unauthorized(&evil.recv().await), "an auth key that does not match the registered key must be rejected");
+
+    // The username is still free and neither key was enrolled.
+    let owner = Identity::generate().unwrap();
+    let mut legit = Client::connect(&hub);
+    let result = legit.register(&owner, "aaron", "workstation", "s2").await;
+    assert!(matches!(result, ProtocolMessage::Established { .. }), "a mismatched-key handshake must persist nothing; got {result:?}");
+}
+
+// -----------------------------------------------------------------------------
 // uat-003 — channel create + ACL + invite redeem; private names never leak.
 // -----------------------------------------------------------------------------
 
