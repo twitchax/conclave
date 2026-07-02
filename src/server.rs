@@ -24,6 +24,11 @@ pub use wss::{ServerConfig, serve};
 
 use crate::protocol::ProtocolError;
 
+/// The server-admin allowlist (DESIGN.md §7): each admin username mapped to the public key
+/// (base64) permitted to claim it, or `None` if unpinned. Pinning stops a fresh-deploy admin
+/// username from being squatted by the first client to register it (PRD-0007 T-002).
+pub type AdminAllowlist = std::collections::HashMap<String, Option<String>>;
+
 /// Errors at the access-control / authorization boundary (DESIGN.md §7, §16), matched on by the
 /// server and surfaced to the caller as a wire error frame.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

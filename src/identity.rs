@@ -52,6 +52,9 @@ pub enum AuthError {
     /// The requested username is already claimed on this server.
     #[error("username `{0}` is already taken")]
     UsernameTaken(String),
+    /// The username is on the admin allowlist pinned to a different key (anti-squat, PRD-0007 §7).
+    #[error("username `{0}` is reserved for a different key")]
+    Reserved(String),
     /// The session handle collides with a live session for this `(user, machine)` (DESIGN.md §5).
     #[error("session handle `{0}` collides with a live session")]
     HandleCollision(String),

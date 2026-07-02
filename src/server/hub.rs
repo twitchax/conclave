@@ -66,13 +66,13 @@ struct HubState {
 /// The central relay's runtime: the embedded store, the server-admin allowlist, and live state.
 pub(crate) struct Hub {
     store: Store,
-    admins: HashSet<String>,
+    admins: super::AdminAllowlist,
     state: Mutex<HubState>,
 }
 
 impl Hub {
     /// Builds a shared hub over `store`, with `admins` as the server-wide admin allowlist (§7).
-    pub(crate) fn new(store: Store, admins: HashSet<String>) -> Arc<Self> {
+    pub(crate) fn new(store: Store, admins: super::AdminAllowlist) -> Arc<Self> {
         Arc::new(Self {
             store,
             admins,
@@ -86,7 +86,7 @@ impl Hub {
 
     /// Whether `user` is a server-wide admin (on the serve-config allowlist, DESIGN.md §7).
     pub(crate) fn is_admin(&self, user: &str) -> bool {
-        self.admins.contains(user)
+        self.admins.contains_key(user)
     }
 
     /// The machines enrolled under `user` (for `machine list`, DESIGN.md §5.1).
@@ -117,11 +117,19 @@ impl Hub {
 
     /// Claims a username and enrolls the calling machine as its first key (self-authorizing, §5.1).
     pub(crate) async fn register(&self, username: &str, machine: &str, pubkey: &[u8]) -> Result<(), ProtocolError> {
+        let pubkey_b64 = identity::encode_key(pubkey);
+
+        // A pinned admin username may be claimed only by its bound key, so an admin name cannot be
+        // squatted first-come on a fresh deploy (anti-squat, PRD-0007 T-002 / DESIGN.md §7).
+        if let Some(Some(bound)) = self.admins.get(username)
+            && &pubkey_b64 != bound
+        {
+            return Err(AuthError::Reserved(username.to_owned()).into());
+        }
+
         if self.store.get_user(username).await.map_err(internal)?.is_some() {
             return Err(AuthError::UsernameTaken(username.to_owned()).into());
         }
-
-        let pubkey_b64 = identity::encode_key(pubkey);
         if self.store.get_machine_by_pubkey(&pubkey_b64).await.map_err(internal)?.is_some() {
             return Err(AuthError::Malformed("public key is already enrolled".to_owned()).into());
         }
@@ -634,7 +642,7 @@ mod tests {
         let store = Store::open_in_memory().await.unwrap();
         store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
         store.create_invite("ops", "tok", token_uses, expires_at, "aaron").await.unwrap();
-        Hub::new(store, HashSet::new())
+        Hub::new(store, HashMap::new())
     }
 
     fn attach_session(hub: &Arc<Hub>, user: &str) -> SessionPath {

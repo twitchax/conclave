@@ -52,7 +52,7 @@ async fn execute(cli: &Cli) -> Void {
             conclavelib::server::serve(conclavelib::server::ServerConfig {
                 bind: args.bind.clone(),
                 data_dir: args.data_dir.clone(),
-                admins: args.admins.iter().cloned().collect(),
+                admins: args.admins.iter().map(|spec| parse_admin_binding(spec)).collect(),
             })
             .await
         }
@@ -526,6 +526,15 @@ impl Command {
     }
 }
 
+/// Parses a `--admin` spec: `user=<pubkey-b64>` pins the name to a key (anti-squat); a bare `user`
+/// is unpinned (claimable first-come — warned at server startup). PRD-0007 T-002.
+fn parse_admin_binding(spec: &str) -> (String, Option<String>) {
+    match spec.split_once('=') {
+        Some((user, pubkey)) => (user.to_owned(), Some(pubkey.to_owned())),
+        None => (spec.to_owned(), None),
+    }
+}
+
 #[derive(Args, Debug)]
 struct ServeArgs {
     /// Address to bind the WSS endpoint to.
@@ -534,8 +543,9 @@ struct ServeArgs {
     /// Directory for the embedded database and server state (in-memory if omitted).
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Username granted server-wide admin (repeatable); the serve-config allowlist (DESIGN.md §7).
-    #[arg(long = "admin")]
+    /// Username granted server-wide admin as `user[=<pubkey-b64>]` (repeatable). Pin the key to
+    /// stop the name being squatted on a fresh deploy; bare `user` is unpinned (DESIGN.md §7).
+    #[arg(long = "admin", value_name = "USER[=PUBKEY]")]
     admins: Vec<String>,
 }
 

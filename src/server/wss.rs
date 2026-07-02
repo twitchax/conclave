@@ -6,7 +6,7 @@
 //! [`ProtocolMessage`](crate::protocol::ProtocolMessage) frames, then driven by the shared
 //! [`run_session`]. A background reaper enforces the idle-heartbeat timeout (DESIGN.md §10).
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use axum::{
@@ -35,8 +35,9 @@ pub struct ServerConfig {
     pub bind: String,
     /// Data directory for the embedded store; `None` runs a purely in-memory store.
     pub data_dir: Option<PathBuf>,
-    /// The server-admin allowlist — usernames that may administer server-wide (§7).
-    pub admins: HashSet<String>,
+    /// The server-admin allowlist — usernames that may administer server-wide (§7), each
+    /// optionally pinned to the public key permitted to claim it (see [`super::AdminAllowlist`]).
+    pub admins: super::AdminAllowlist,
 }
 
 /// Runs the central server until a shutdown signal (Ctrl-C) is received.
@@ -50,6 +51,11 @@ pub async fn serve(config: ServerConfig) -> Void {
         Some(path) => Store::open(path).await?,
         None => Store::open_in_memory().await?,
     };
+    for (name, pin) in &config.admins {
+        if pin.is_none() {
+            tracing::warn!(admin = %name, "admin username is unpinned and can be squatted by the first client to register it; pin it as `--admin <user>=<pubkey>`");
+        }
+    }
     let hub = Hub::new(store, config.admins);
 
     spawn_reaper(Arc::clone(&hub));

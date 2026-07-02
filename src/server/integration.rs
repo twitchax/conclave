@@ -23,9 +23,9 @@ use super::{hub::Hub, session::handle_connection};
 // Harness.
 // -----------------------------------------------------------------------------
 
-async fn hub_with(admins: &[&str]) -> Arc<Hub> {
+async fn hub_with(admins: &[(&str, Option<&str>)]) -> Arc<Hub> {
     let store = crate::store::Store::open_in_memory().await.unwrap();
-    Hub::new(store, admins.iter().map(|a| (*a).to_owned()).collect())
+    Hub::new(store, admins.iter().map(|(user, pin)| ((*user).to_owned(), pin.map(str::to_owned))).collect())
 }
 
 async fn hub() -> Arc<Hub> {
@@ -352,6 +352,30 @@ async fn server_register_proof_key_mismatch_persists_nothing() {
     let mut legit = Client::connect(&hub);
     let result = legit.register(&owner, "aaron", "workstation", "s2").await;
     assert!(matches!(result, ProtocolMessage::Established { .. }), "a mismatched-key handshake must persist nothing; got {result:?}");
+}
+
+// -----------------------------------------------------------------------------
+// PRD-0007 T-002 (admin_bootstrap) — a pinned admin username is claimable only by its bound
+// key, so a fresh-deploy admin name cannot be squatted first-come (DESIGN.md §7).
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_admin_bootstrap_reserved_name_rejects_wrong_key() {
+    let admin_id = Identity::generate().unwrap();
+    let attacker = Identity::generate().unwrap();
+    let bound = admin_id.public_key_base64();
+    let hub = hub_with(&[("aaron", Some(&bound))]).await;
+
+    // A different key cannot claim the pinned admin username, even with a valid possession proof.
+    let mut evil = Client::connect(&hub);
+    let denied = evil.register(&attacker, "aaron", "evil", "s1").await;
+    assert!(is_unauthorized(&denied), "a pinned admin name must reject a non-matching key; got {denied:?}");
+
+    // The bound key claims it and is granted admin (ListUsers is a server-admin-only op).
+    let mut legit = Client::connect(&hub);
+    established_path(legit.register(&admin_id, "aaron", "workstation", "s2").await);
+    legit.send(ProtocolMessage::ListUsers).await;
+    assert!(matches!(legit.recv().await, ProtocolMessage::UserList { .. }), "the key-bound admin must be granted admin rights");
 }
 
 // -----------------------------------------------------------------------------
