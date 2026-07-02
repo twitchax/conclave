@@ -227,7 +227,9 @@ impl Hub {
                 Visibility::Public | Visibility::Unlisted => {}
                 // Private requires an ACL entry (absent here) or a valid invite that grants one.
                 Visibility::Private => {
-                    let token = token.ok_or_else(|| ProtocolError::from(AclError::ChannelPrivate(channel.to_owned())))?;
+                    // Denials on a private channel return the same `not found` as an absent channel,
+                    // so its existence never leaks to a non-member (finding #12).
+                    let token = token.ok_or_else(|| ProtocolError::from(AclError::ChannelNotFound(channel.to_owned())))?;
                     self.redeem_invite(channel, token).await?;
                     self.store.add_channel_member(channel, user).await.map_err(internal)?;
                 }
@@ -266,15 +268,18 @@ impl Hub {
             return Ok(self.present_paths());
         };
 
-        // The channel must exist; a non-member is refused (the NotFound/NotMember split is an
-        // information leak revisited in T-007).
-        self.store
-            .get_channel(channel)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| ProtocolError::from(AclError::ChannelNotFound(channel.to_owned())))?;
-        if !self.store.is_channel_member(channel, user).await.map_err(internal)? && !self.is_admin(user) {
-            return Err(AclError::NotMember(channel.to_owned()).into());
+        // Presence is visible on a public channel to anyone — so a participant who holds no ACL
+        // entry can still query it (finding #13) — and on a private/unlisted channel only to a
+        // member or admin. Otherwise return the same `not found` as an absent channel, so the
+        // existence of a private/unlisted channel never leaks (finding #12).
+        let not_found = || ProtocolError::from(AclError::ChannelNotFound(channel.to_owned()));
+        let record = self.store.get_channel(channel).await.map_err(internal)?.ok_or_else(not_found)?;
+        let allowed = match parse_visibility(&record.visibility) {
+            Visibility::Public => true,
+            Visibility::Unlisted | Visibility::Private => self.store.is_channel_member(channel, user).await.map_err(internal)? || self.is_admin(user),
+        };
+        if !allowed {
+            return Err(not_found());
         }
 
         let st = self.state();
@@ -446,23 +451,25 @@ impl Hub {
     }
 
     async fn redeem_invite(&self, channel: &str, token: &str) -> Result<(), ProtocolError> {
+        // An invalid / wrong-channel / expired / spent token is refused as `not found`, matching an
+        // absent channel so a private channel's existence never leaks (finding #12).
         let invite = self
             .store
             .get_invite(token)
             .await
             .map_err(internal)?
             .filter(|inv| inv.channel == channel)
-            .ok_or_else(|| ProtocolError::from(AclError::ChannelPrivate(channel.to_owned())))?;
+            .ok_or_else(|| ProtocolError::from(AclError::ChannelNotFound(channel.to_owned())))?;
 
         if invite.expires_at.as_deref().is_some_and(is_expired) {
             self.store.delete_invite(token).await.map_err(internal)?;
-            return Err(AclError::ChannelPrivate(channel.to_owned()).into());
+            return Err(AclError::ChannelNotFound(channel.to_owned()).into());
         }
 
         // Unlimited tokens (`None`) grant access without consuming a use; a limited token atomically
         // consumes one, so concurrent redeemers of the last use are mutually exclusive (T-003).
         if invite.uses_remaining.is_some() && !self.store.try_consume_invite_use(token).await.map_err(internal)? {
-            return Err(AclError::ChannelPrivate(channel.to_owned()).into());
+            return Err(AclError::ChannelNotFound(channel.to_owned()).into());
         }
         Ok(())
     }

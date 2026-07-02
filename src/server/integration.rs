@@ -157,6 +157,10 @@ fn is_unauthorized(frame: &ProtocolMessage) -> bool {
     matches!(frame, ProtocolMessage::Error(ProtocolError::Unauthorized(_)))
 }
 
+fn is_not_found(frame: &ProtocolMessage) -> bool {
+    matches!(frame, ProtocolMessage::Error(ProtocolError::NotFound(_)))
+}
+
 // -----------------------------------------------------------------------------
 // uat-001 — registration + enrollment; duplicate username / live handle rejected.
 // -----------------------------------------------------------------------------
@@ -406,6 +410,69 @@ async fn server_identity_validation_rejects_a_session_handle_with_a_path_separat
 }
 
 // -----------------------------------------------------------------------------
+// PRD-0007 T-007 (visibility_oracle) — who() must not leak the existence of a private/unlisted
+// channel to a non-member (#12), and must work for a participant of a public channel (#13).
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_who_visibility_oracle_hides_private_channel_existence() {
+    let hub = hub().await;
+    let owner = Identity::generate().unwrap();
+    let outsider = Identity::generate().unwrap();
+
+    let mut a = Client::connect(&hub);
+    established_path(a.register(&owner, "aaron", "wa", "sa").await);
+    a.admin(AdminOp::CreateChannel {
+        name: "ops".to_owned(),
+        visibility: Visibility::Private,
+    })
+    .await;
+
+    let mut b = Client::connect(&hub);
+    established_path(b.register(&outsider, "david", "wd", "sb").await);
+
+    // who() on a private channel the caller cannot see must be indistinguishable from a channel
+    // that does not exist at all.
+    b.send(ProtocolMessage::Who { channel: Some("ops".to_owned()) }).await;
+    let on_private = b.recv().await;
+    b.send(ProtocolMessage::Who { channel: Some("ghost".to_owned()) }).await;
+    let on_absent = b.recv().await;
+    assert!(
+        is_not_found(&on_private) && is_not_found(&on_absent),
+        "who() must not leak private-channel existence, got {on_private:?} vs {on_absent:?}"
+    );
+}
+
+#[tokio::test]
+async fn server_who_is_open_to_a_public_channel_participant() {
+    let hub = hub().await;
+    let owner = Identity::generate().unwrap();
+    let guest = Identity::generate().unwrap();
+
+    let mut a = Client::connect(&hub);
+    established_path(a.register(&owner, "aaron", "wa", "sa").await);
+    a.admin(AdminOp::CreateChannel {
+        name: "lobby".to_owned(),
+        visibility: Visibility::Public,
+    })
+    .await;
+
+    let mut b = Client::connect(&hub);
+    let bpath = established_path(b.register(&guest, "david", "wd", "sb").await);
+    assert!(matches!(b.join("lobby", None).await, ProtocolMessage::Joined { .. }));
+
+    // A participant of a public channel holds no ACL entry, but must still be able to see presence.
+    b.send(ProtocolMessage::Who { channel: Some("lobby".to_owned()) }).await;
+    match b.recv().await {
+        ProtocolMessage::Presence { channel, sessions } => {
+            assert_eq!(channel.as_deref(), Some("lobby"));
+            assert!(sessions.contains(&bpath), "the participant must see themselves in presence");
+        }
+        other => panic!("expected Presence, got {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------------------------
 // uat-003 — channel create + ACL + invite redeem; private names never leak.
 // -----------------------------------------------------------------------------
 
@@ -430,7 +497,7 @@ async fn server_channel_create_acl_and_invite_redeem() {
     let mut b = Client::connect(&hub);
     let bpath = established_path(b.register(&guest, "david", "wd", "sb").await);
     let denied = b.join("ops", None).await;
-    assert!(is_unauthorized(&denied), "private join without a token must be denied, got {denied:?}");
+    assert!(is_not_found(&denied), "private join without a token must be denied as not-found, got {denied:?}");
 
     // The channel admin mints a single-use invite; redeeming it joins and adds david to the ACL.
     let token = invite_token(
@@ -449,7 +516,7 @@ async fn server_channel_create_acl_and_invite_redeem() {
     let mut c = Client::connect(&hub);
     established_path(c.register(&latecomer, "carol", "wc", "sc").await);
     let spent = c.join("ops", Some(&token)).await;
-    assert!(is_unauthorized(&spent), "a spent single-use invite must be refused, got {spent:?}");
+    assert!(is_not_found(&spent), "a spent single-use invite must be refused as not-found, got {spent:?}");
 }
 
 #[tokio::test]
@@ -558,8 +625,9 @@ async fn server_visibility_private_is_hidden_and_gated() {
     let mut b = Client::connect(&hub);
     established_path(b.register(&outsider, "david", "wd", "sb").await);
 
-    // Private is not joinable without an ACL entry or token...
-    assert!(is_unauthorized(&b.join("ops", None).await), "private join without a token must be denied");
+    // Private is not joinable without an ACL entry or token, and is refused as not-found so its
+    // existence never leaks (finding #12)...
+    assert!(is_not_found(&b.join("ops", None).await), "private join without a token must be denied as not-found");
     // ...and never appears in discovery for a non-member.
     b.send(ProtocolMessage::ListChannels).await;
     assert_eq!(sorted_channel_names(b.recv().await), Vec::<String>::new(), "private must not leak into discovery");
