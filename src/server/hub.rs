@@ -274,12 +274,15 @@ impl Hub {
     pub(crate) async fn list_channels(&self, user: &str) -> Result<Vec<ChannelInfo>, ProtocolError> {
         let channels = self.store.list_channels().await.map_err(internal)?;
         let memberships: HashSet<String> = self.store.list_user_memberships(user).await.map_err(internal)?.into_iter().collect();
+        // Server admins enumerate everything (operator visibility — an admin must be able to audit
+        // channels they are not a member of); everyone else sees public + their memberships.
+        let admin = self.is_admin(user);
         let infos = channels
             .into_iter()
             .filter_map(|c| {
                 let visibility = parse_visibility(&c.visibility);
                 let member = memberships.contains(&c.name);
-                let visible = matches!(visibility, Visibility::Public) || member;
+                let visible = admin || matches!(visibility, Visibility::Public) || member;
                 visible.then_some(ChannelInfo { name: c.name, visibility, member })
             })
             .collect();
@@ -403,6 +406,12 @@ impl Hub {
                 self.unsubscribe_user(&target, &channel);
                 Ok(ack(target))
             }
+            // Channel-admin membership audit: who is on this channel's ACL (not live presence).
+            AdminOp::AclList { channel } => {
+                self.authorize_channel_admin(&channel, user).await?;
+                let users = self.store.list_channel_members(&channel).await.map_err(internal)?;
+                Ok(ProtocolMessage::UserList { users })
+            }
             AdminOp::InviteCreate { channel, uses, expires_in_secs } => {
                 self.authorize_channel_admin(&channel, user).await?;
                 let token = identity::generate_token().map_err(internal)?;
@@ -443,19 +452,7 @@ impl Hub {
                 if !self.is_admin(user) {
                     return Err(AclError::NotAdmin.into());
                 }
-                // Delete the channels this user created (cascading their memberships + invites) and
-                // purge the user's memberships elsewhere, so re-registering the freed name cannot
-                // inherit channel-admin rights or private access (finding #6).
-                for channel in self.store.list_channels_created_by(&username).await.map_err(internal)? {
-                    self.store.delete_channel(&channel).await.map_err(internal)?;
-                    self.drop_channel(&channel);
-                }
-                self.store.delete_user_memberships(&username).await.map_err(internal)?;
-                for machine in self.store.list_machines(&username).await.map_err(internal)? {
-                    self.store.delete_machine(&username, &machine.name).await.map_err(internal)?;
-                }
-                self.store.delete_user(&username).await.map_err(internal)?;
-                self.force_drop_user(&username);
+                self.remove_user(&username).await?;
                 Ok(ack(username))
             }
             // The lost-laptop kill switch: a user revokes their own machine key (§5.1).
@@ -476,6 +473,23 @@ impl Hub {
                 Ok(ack(name))
             }
         }
+    }
+
+    /// Erases a user entirely: their created channels (cascading memberships + invites + bans),
+    /// their memberships elsewhere, their machines, and the user row — so re-registering the freed
+    /// name cannot inherit channel-admin rights or private access (finding #6). Live sessions drop.
+    async fn remove_user(&self, username: &str) -> Result<(), ProtocolError> {
+        for channel in self.store.list_channels_created_by(username).await.map_err(internal)? {
+            self.store.delete_channel(&channel).await.map_err(internal)?;
+            self.drop_channel(&channel);
+        }
+        self.store.delete_user_memberships(username).await.map_err(internal)?;
+        for machine in self.store.list_machines(username).await.map_err(internal)? {
+            self.store.delete_machine(username, &machine.name).await.map_err(internal)?;
+        }
+        self.store.delete_user(username).await.map_err(internal)?;
+        self.force_drop_user(username);
+        Ok(())
     }
 
     async fn authorize_channel_admin(&self, channel: &str, user: &str) -> Result<ChannelRecord, ProtocolError> {
@@ -782,6 +796,54 @@ mod tests {
         // The non-admin did not actually delete the token: a legitimate redeemer still gets in.
         let carol = attach_session(&hub, "carol");
         assert!(hub.join("carol", &carol, "ops", Some("tok")).await.is_ok(), "a non-admin revoke must not delete the token");
+    }
+
+    #[tokio::test]
+    async fn list_channels_shows_a_server_admin_everything() {
+        let store = Store::open_in_memory().await.unwrap();
+        // alice's private channel; neither root (server admin) nor bob is a member.
+        store.create_channel("secret", Visibility::Private, "alice").await.unwrap();
+        let hub = Hub::new(store, HashMap::from([("root".to_owned(), None)])).await.unwrap();
+
+        // The server admin can enumerate every channel (operator visibility)...
+        let admin_view: Vec<String> = hub.list_channels("root").await.unwrap().into_iter().map(|c| c.name).collect();
+        assert!(admin_view.contains(&"secret".to_owned()), "a server admin must see private channels: {admin_view:?}");
+
+        // ...while a regular non-member still cannot discover it.
+        let bob_view: Vec<String> = hub.list_channels("bob").await.unwrap().into_iter().map(|c| c.name).collect();
+        assert!(!bob_view.contains(&"secret".to_owned()), "a private channel must stay hidden from non-members: {bob_view:?}");
+    }
+
+    #[tokio::test]
+    async fn acl_list_returns_members_to_channel_admins_only() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
+        let hub = Hub::new(store, HashMap::new()).await.unwrap();
+
+        hub.admin(
+            "aaron",
+            AdminOp::AclAdd {
+                channel: "ops".to_owned(),
+                user: "david".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The channel admin (creator) lists the membership — the creator is a member from creation.
+        match hub.admin("aaron", AdminOp::AclList { channel: "ops".to_owned() }).await.unwrap() {
+            ProtocolMessage::UserList { mut users } => {
+                users.sort();
+                assert_eq!(users, vec!["aaron".to_owned(), "david".to_owned()]);
+            }
+            other => panic!("expected a UserList, got {other:?}"),
+        }
+
+        // A non-admin is refused.
+        assert!(
+            hub.admin("mallory", AdminOp::AclList { channel: "ops".to_owned() }).await.is_err(),
+            "a non-admin must not list a channel's members",
+        );
     }
 
     #[tokio::test]

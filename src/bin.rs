@@ -342,6 +342,7 @@ async fn run_acl(explicit: Option<&PathBuf>, command: &AclCommand) -> Void {
             )
             .await
         }
+        AclCommand::List { server, channel } => admin_op(explicit, server, AdminOp::AclList { channel: channel.clone() }).await,
     }
 }
 
@@ -744,6 +745,15 @@ enum AclCommand {
         channel: String,
         /// Username to remove.
         user: String,
+    },
+    /// List the users on a channel's access-control list (channel-admin).
+    List {
+        /// Server the channel is on.
+        #[arg(long)]
+        server: String,
+        /// Channel to list.
+        #[arg(long)]
+        channel: String,
     },
 }
 

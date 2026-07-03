@@ -157,6 +157,11 @@ pub enum AdminOp {
         /// The new machine's Ed25519 public key (proves possession on its own first connect).
         pubkey: Vec<u8>,
     },
+    /// List a channel's ACL members (channel-admin; answered with a `UserList`).
+    AclList {
+        /// Channel name.
+        channel: String,
+    },
 }
 
 /// The versioned frame exchanged between a bridge and a central server.
@@ -468,6 +473,11 @@ mod tests {
             name: "sno-box".to_owned(),
             pubkey: vec![1, 2, 3, 4],
         }));
+    }
+
+    #[test]
+    fn acl_list_admin_op_round_trips() {
+        assert_round_trips(&ProtocolMessage::Admin(AdminOp::AclList { channel: "ops".to_owned() }));
     }
 
     #[test]
