@@ -215,6 +215,8 @@ async fn e2e_serve_exports_otlp_spans_when_endpoint_is_set() {
         Command::new(CONCLAVE_BIN)
             .args(["serve", "--bind", &addr.to_string(), "--ephemeral"])
             .env("CONCLAVE_OTLP_ENDPOINT", format!("http://{collector_addr}"))
+            // Authenticated collectors (e.g. Grafana Cloud) take the standard OTel headers env.
+            .env("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Basic dGVzdC10b2tlbg==")
             // The request spans are debug-level; export cadence tightened so the test is quick.
             .env("RUST_LOG", "debug")
             .env("OTEL_BSP_SCHEDULE_DELAY", "200")
@@ -231,6 +233,10 @@ async fn e2e_serve_exports_otlp_spans_when_endpoint_is_set() {
 
     let head = timeout(Duration::from_secs(20), hit_rx).await.expect("no OTLP export arrived within 20s").unwrap();
     assert!(head.starts_with("POST") && head.contains("/v1/traces"), "expected an OTLP trace POST, got: {head}");
+    assert!(
+        head.to_ascii_lowercase().contains("authorization: basic dgvzdc10b2tlbg=="),
+        "OTEL_EXPORTER_OTLP_HEADERS must reach the collector (Grafana Cloud auth): {head}"
+    );
 }
 
 #[test]

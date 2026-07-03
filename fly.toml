@@ -15,9 +15,12 @@ primary_region = "sjc"
   CONCLAVE_DATA_DIR = "/data"
   RUST_LOG = "info"
   # Observability (PRD-0014). `RUST_LOG=debug` adds per-request spans and frame dispatch;
-  # uncomment for structured log pipelines / an OTLP collector (base URL — /v1/traces is appended):
+  # uncomment for structured log pipelines / an OTLP collector (base URL — /v1/traces is appended).
+  # Authenticated collectors (Grafana Cloud etc.) take the standard headers env; set BOTH of these
+  # as secrets instead so the token stays out of the repo:
+  #   fly secrets set CONCLAVE_OTLP_ENDPOINT="https://otlp-gateway-<region>.grafana.net/otlp" \
+  #                   OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64 instance-id:token>"
   #   CONCLAVE_LOG_FORMAT = "json"
-  #   CONCLAVE_OTLP_ENDPOINT = "http://your-collector:4318"
   # Do NOT put the admin here — set it as a secret so the name is pinned to your key:
   #   fly secrets set CONCLAVE_ADMINS="you=<your-pubkey-b64-from-`conclave key`>"
 
