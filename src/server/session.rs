@@ -213,6 +213,8 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
 
 /// Dispatches one inbound frame from an authenticated session to the hub.
 async fn handle_frame(hub: &Arc<Hub>, ctx: &SessionCtx, outbound: &Outbound, frame: ProtocolMessage) -> ControlFlow<()> {
+    // The frame *kind* only — bodies, tokens, and keys never reach telemetry (PRD-0014).
+    tracing::debug!(path = %ctx.path, frame = frame.kind(), "dispatch");
     let user = &ctx.path.user;
     match frame {
         ProtocolMessage::Ping => {
@@ -318,5 +320,8 @@ fn accept_component(outbound: &Outbound, label: &str, value: &str) -> bool {
 
 /// Wraps a wire error as an [`ProtocolMessage::Error`] frame.
 fn err(error: ProtocolError) -> ProtocolMessage {
+    // Every refusal / termination the server sends is also visible to the operator (PRD-0014):
+    // this one line covers handshake failures, ACL denials, and force-drop reasons.
+    tracing::warn!(%error, "error frame emitted");
     ProtocolMessage::Error(error)
 }

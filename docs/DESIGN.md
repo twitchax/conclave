@@ -353,6 +353,14 @@ whisper history (ephemeral by decision); **permission levels** (local bridge con
   sessions for the revoked key/user.
 - Missing/changed experimental capability (CC drift) → the bridge surfaces a clear message at MCP
   handshake.
+- **Observability (PRD-0014):** the server's request paths (`register`, `join`, `post`,
+  `read_since`, `whisper`, admin ops) are `#[instrument]`ed spans carrying the caller path and
+  channel; lifecycle (established / superseded / detached) logs at info, every emitted error frame
+  at warn, per-frame dispatch at debug. Telemetry carries frame *kinds* only — message bodies,
+  invite tokens, and key material never reach logs. Env surface: `RUST_LOG` (level),
+  `CONCLAVE_LOG_FORMAT=json` (structured stderr for log pipelines), and — `serve` only —
+  `CONCLAVE_OTLP_ENDPOINT=<collector base URL>` lights up OTLP/HTTP trace export (no endpoint,
+  no exporter).
 
 ## 17. Testing
 

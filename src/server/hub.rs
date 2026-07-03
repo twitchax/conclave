@@ -174,6 +174,7 @@ impl Hub {
     // -----------------------------------------------------------------------
 
     /// Claims a username and enrolls the calling machine as its first key (self-authorizing, §5.1).
+    #[tracing::instrument(level = "debug", skip(self, pubkey))]
     pub(crate) async fn register(&self, username: &str, machine: &str, pubkey: &[u8]) -> Result<(), ProtocolError> {
         let pubkey_b64 = identity::encode_key(pubkey);
 
@@ -220,7 +221,9 @@ impl Hub {
         if let Some(existing) = st.sessions.get(path) {
             existing.kill.fire("session superseded by a newer connection for the same session path");
             Self::take_session(&mut st, path);
+            tracing::info!(%path, "session superseded by a newer connection");
         }
+        tracing::info!(%path, user, machine, "session established");
 
         let kill = Arc::new(Kill::new());
         st.sessions.insert(
@@ -243,6 +246,7 @@ impl Hub {
         let mut st = self.state();
         if st.sessions.get(path).is_some_and(|e| Arc::ptr_eq(&e.kill, kill)) {
             Self::take_session(&mut st, path);
+            tracing::debug!(%path, "session detached");
         }
     }
 
@@ -275,6 +279,7 @@ impl Hub {
     // -----------------------------------------------------------------------
 
     /// Joins a channel — authorized by visibility, ACL membership, or a redeemed invite token (§6).
+    #[tracing::instrument(level = "debug", skip(self, token), fields(path = %path))]
     pub(crate) async fn join(&self, user: &str, path: &SessionPath, channel: &str, token: Option<&str>) -> Result<(), ProtocolError> {
         let record = self
             .store
@@ -366,6 +371,7 @@ impl Hub {
     /// Fans a channel message out to every *other* subscribed session; the sender must be a member.
     /// The message is retained for catch-up before delivery (PRD-0013): a failed history write
     /// logs and still delivers — availability over completeness.
+    #[tracing::instrument(level = "debug", skip(self, payload), fields(from = %from))]
     pub(crate) async fn post(&self, from: &SessionPath, channel: &str, payload: Payload) -> Result<(), ProtocolError> {
         let targets: Vec<(Arc<Kill>, Outbound)> = {
             let st = self.state();
@@ -408,6 +414,7 @@ impl Hub {
     /// Reads a channel's retained history strictly after `since_ms` (PRD-0013 T-002). The caller
     /// must be subscribed — the same check (and the same error) as posting, so a refusal never
     /// reveals whether a private channel exists.
+    #[tracing::instrument(level = "debug", skip(self), fields(caller = %caller))]
     pub(crate) async fn read_since(&self, caller: &SessionPath, channel: &str, since_ms: i64) -> Result<ProtocolMessage, ProtocolError> {
         {
             let st = self.state();
@@ -431,6 +438,7 @@ impl Hub {
     }
 
     /// Delivers a whisper to exactly one live session path, erroring if it is not online (§8).
+    #[tracing::instrument(level = "debug", skip(self, payload), fields(from = %from, target = %target))]
     pub(crate) fn whisper(&self, from: &SessionPath, target: &SessionPath, payload: Payload) -> Result<(), ProtocolError> {
         let target_entry = self.state().sessions.get(target).map(|e| (Arc::clone(&e.kill), e.outbound.clone()));
         let Some((kill, outbound)) = target_entry else {
@@ -454,6 +462,7 @@ impl Hub {
     // -----------------------------------------------------------------------
 
     /// Authorizes and applies an admin / control operation, returning the response frame.
+    #[tracing::instrument(level = "debug", skip(self, op), fields(op = op.name()))]
     pub(crate) async fn admin(&self, user: &str, op: AdminOp) -> Reply {
         match op {
             // Any authenticated user may create a channel and becomes its channel-admin (§7).
@@ -871,6 +880,66 @@ mod tests {
         let (tx, _rx) = mpsc::channel(super::super::session::OUTBOUND_CAPACITY);
         hub.attach(&path, user, "machine", tx);
         path
+    }
+
+    /// A shared in-memory sink usable as a `tracing` writer (PRD-0014 uat-001).
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Buf {
+        type Writer = Buf;
+
+        fn make_writer(&self) -> Buf {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_request_paths_emit_spans_with_path_and_channel_fields() {
+        // Capture everything the request paths emit (PRD-0014 T-001). Single-threaded test
+        // runtime, so the scoped default subscriber holds across awaits.
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
+        let hub = Hub::new(store, HashMap::new()).await.unwrap();
+
+        let aaron = attach_session(&hub, "aaron");
+        hub.join("aaron", &aaron, "ops", None).await.unwrap();
+        hub.post(&aaron, "ops", Payload::Plain("observable".to_owned())).await.unwrap();
+        hub.read_since(&aaron, "ops", 0).await.unwrap();
+
+        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        // Lifecycle is an event carrying the full session path…
+        assert!(
+            output.contains("session established") && output.contains("aaron/machine/session"),
+            "attach must log establishment with the path: {output}"
+        );
+        // …and each request path is a span carrying the caller and channel fields.
+        for span in ["join", "post", "read_since"] {
+            assert!(output.contains(span), "the `{span}` path must be instrumented: {output}");
+        }
+        assert!(output.contains("ops"), "spans must carry the channel: {output}");
+        // Message bodies must NOT be logged (privacy: telemetry never contains content).
+        assert!(!output.contains("observable"), "payload bodies must never reach telemetry: {output}");
     }
 
     #[tokio::test]

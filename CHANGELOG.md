@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [Unreleased]
+
+### Added
+
+- **Server observability (PRD-0014).** Real span coverage on every request path (register, join,
+  post, read-since, whisper, admin ops) with caller/channel fields — frame *kinds* only, so
+  message bodies, invite tokens, and keys never reach telemetry; lifecycle at info, every emitted
+  error frame at warn, per-frame dispatch at debug. `CONCLAVE_LOG_FORMAT=json` switches stderr to
+  JSON lines for log pipelines, and `CONCLAVE_OTLP_ENDPOINT=<collector>` (serve-only, env-gated)
+  exports traces over OTLP/HTTP — no endpoint, no exporter.
+
 ## [0.3.0] - 2026-07-03
 
 Message history: the server remembers, and agents can catch up. Minor bump for the protocol

@@ -169,6 +169,70 @@ async fn e2e_serve_drops_a_connection_that_sends_an_oversized_frame() {
     assert!(dropped, "the server must drop a connection that sends an oversized frame");
 }
 
+#[tokio::test]
+async fn e2e_serve_log_format_json_emits_parseable_lines() {
+    let addr = free_loopback_addr();
+    let mut server = tokio::process::Command::new(CONCLAVE_BIN)
+        .args(["serve", "--bind", &addr.to_string(), "--ephemeral"])
+        .env("CONCLAVE_LOG_FORMAT", "json")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `conclave serve`");
+
+    // Every log line must be one parseable JSON object (PRD-0014 T-003) — assert on the startup
+    // line, which always fires.
+    let mut lines = BufReader::new(server.stderr.take().unwrap()).lines();
+    let line = loop {
+        let line = timeout(Duration::from_secs(15), lines.next_line()).await.unwrap().unwrap().expect("serve exited without logging");
+        if line.contains("listening") {
+            break line;
+        }
+    };
+    let value: Value = serde_json::from_str(&line).unwrap_or_else(|err| panic!("CONCLAVE_LOG_FORMAT=json must produce JSON lines ({err}): {line}"));
+    assert_eq!(value.pointer("/fields/message").and_then(Value::as_str), Some("conclave server listening"), "unexpected shape: {value}");
+}
+
+#[tokio::test]
+async fn e2e_serve_exports_otlp_spans_when_endpoint_is_set() {
+    // A fake OTLP collector: accept one HTTP request, hand its head to the test (PRD-0014 T-002).
+    let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let collector_addr = collector.local_addr().unwrap();
+    let (hit_tx, hit_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = collector.accept().await {
+            use tokio::io::AsyncWriteExt as _;
+            let mut buf = vec![0_u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+            let _ = hit_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+    });
+
+    let addr = free_loopback_addr();
+    let _server = ServerProcess(
+        Command::new(CONCLAVE_BIN)
+            .args(["serve", "--bind", &addr.to_string(), "--ephemeral"])
+            .env("CONCLAVE_OTLP_ENDPOINT", format!("http://{collector_addr}"))
+            // The request spans are debug-level; export cadence tightened so the test is quick.
+            .env("RUST_LOG", "debug")
+            .env("OTEL_BSP_SCHEDULE_DELAY", "200")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn `conclave serve`"),
+    );
+    wait_for_listener(addr).await;
+
+    // Drive one instrumented request path so there is a span to export.
+    let mut ws = ws_connect(addr).await;
+    ws_register(&mut ws, &Identity::generate().unwrap(), "aaron", "workstation", "otel").await;
+
+    let head = timeout(Duration::from_secs(20), hit_rx).await.expect("no OTLP export arrived within 20s").unwrap();
+    assert!(head.starts_with("POST") && head.contains("/v1/traces"), "expected an OTLP trace POST, got: {head}");
+}
+
 #[test]
 fn e2e_serve_requires_a_data_dir_or_ephemeral() {
     let config = TempDir::new().unwrap();

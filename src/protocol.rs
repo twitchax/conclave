@@ -192,6 +192,33 @@ pub enum AdminOp {
     },
 }
 
+impl AdminOp {
+    /// The operation's name for telemetry (PRD-0014): never the contents — invite tokens and
+    /// public keys must not reach logs.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::CreateChannel { .. } => "create_channel",
+            Self::DeleteChannel { .. } => "delete_channel",
+            Self::RenameChannel { .. } => "rename_channel",
+            Self::SetVisibility { .. } => "set_visibility",
+            Self::AclAdd { .. } => "acl_add",
+            Self::AclRemove { .. } => "acl_remove",
+            Self::InviteCreate { .. } => "invite_create",
+            Self::InviteRevoke { .. } => "invite_revoke",
+            Self::Kick { .. } => "kick",
+            Self::Ban { .. } => "ban",
+            Self::UserRemove { .. } => "user_remove",
+            Self::MachineRemove { .. } => "machine_remove",
+            Self::MachineAdd { .. } => "machine_add",
+            Self::AclList { .. } => "acl_list",
+            Self::Unban { .. } => "unban",
+            Self::BanList { .. } => "ban_list",
+            Self::InviteList { .. } => "invite_list",
+        }
+    }
+}
+
 /// The versioned frame exchanged between a bridge and a central server.
 ///
 /// Variants are append-only across protocol versions: later milestones may add variants but must
@@ -359,6 +386,44 @@ pub enum ProtocolMessage {
         /// The messages, oldest-first.
         messages: Vec<HistoryMessage>,
     },
+}
+
+impl ProtocolMessage {
+    /// The frame's name for telemetry (PRD-0014): the kind only — never field contents, so
+    /// message bodies, tokens, and key material cannot reach logs.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "hello",
+            Self::Challenge { .. } => "challenge",
+            Self::Auth { .. } => "auth",
+            Self::Established { .. } => "established",
+            Self::Register { .. } => "register",
+            Self::Join { .. } => "join",
+            Self::Leave { .. } => "leave",
+            Self::Who { .. } => "who",
+            Self::Admin(op) => op.name(),
+            Self::ChannelMsg { .. } => "channel_msg",
+            Self::Whisper { .. } => "whisper",
+            Self::Presence { .. } => "presence",
+            Self::Error(_) => "error",
+            Self::ListChannels => "list_channels",
+            Self::ChannelList { .. } => "channel_list",
+            Self::Joined { .. } => "joined",
+            Self::Ack { .. } => "ack",
+            Self::InviteToken { .. } => "invite_token",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+            Self::ServerInfo { .. } => "server_info",
+            Self::ListMachines => "list_machines",
+            Self::MachineList { .. } => "machine_list",
+            Self::ListUsers => "list_users",
+            Self::UserList { .. } => "user_list",
+            Self::InviteList { .. } => "invite_list",
+            Self::ReadSince { .. } => "read_since",
+            Self::History { .. } => "history",
+        }
+    }
 }
 
 /// One retained channel message as surfaced by [`ProtocolMessage::History`] (PRD-0013).
