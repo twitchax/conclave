@@ -203,6 +203,91 @@ async fn e2e_serve_health_endpoint_returns_ok() {
     assert!(response.trim_end().ends_with("ok"), "health check body must be `ok`, got: {response:?}");
 }
 
+#[test]
+fn e2e_completions_generate_for_common_shells() {
+    for shell in ["bash", "zsh", "fish"] {
+        let output = run_cli(TempDir::new().unwrap().path(), &["completions", shell]);
+        assert!(output.status.success(), "completions {shell} failed");
+        assert!(stdout_of(&output).contains("conclave"), "completions {shell} must mention the binary");
+    }
+}
+
+/// `conclave send` posts one message; `conclave tail` streams a channel to stdout — the CLI as a
+/// human client (PRD-0011 T-004): what a person uses to watch/join agent chatter without a session.
+#[tokio::test]
+async fn cli_send_and_tail_relay_a_message_through_a_live_channel() {
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let _server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+
+    let home = TempDir::new().unwrap();
+    let dir = home.path();
+    assert!(run_cli(dir, &["register", "--server", &url, "--username", "aaron", "--machine", "workstation"]).status.success());
+    assert!(run_cli(dir, &["channel", "create", "--server", &url, "watch", "--visibility", "public"]).status.success());
+
+    // Start `tail` streaming the channel...
+    let mut tail = tokio::process::Command::new(CONCLAVE_BIN)
+        .args(["tail", "--config-dir", dir.to_str().unwrap(), "--server", &url, "--channel", "watch"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `conclave tail`");
+    let mut tail_lines = BufReader::new(tail.stdout.take().unwrap()).lines();
+    // ...and wait for it to announce its subscription so the send can't race the join.
+    let ready = timeout(Duration::from_secs(15), tail_lines.next_line()).await.unwrap().unwrap().unwrap();
+    assert!(ready.contains("watch"), "tail must announce the joined channel: {ready}");
+
+    // A one-shot `send` posts to the channel (server-acked)...
+    let send = run_cli(dir, &["send", "--server", &url, "--channel", "watch", "hello from the plain CLI"]);
+    assert!(send.status.success(), "send failed: {}", String::from_utf8_lossy(&send.stderr));
+
+    // ...and the tail streams it with the sender path.
+    let line = timeout(Duration::from_secs(15), tail_lines.next_line()).await.unwrap().unwrap().unwrap();
+    assert!(
+        line.contains("hello from the plain CLI") && line.contains("aaron/workstation"),
+        "tail must stream the message with its sender: {line}"
+    );
+}
+
+/// `conclave status` is the one-command identity/connectivity view: registrations, per-server
+/// reachability, and the resolved permission table; an unreachable server exits non-zero.
+#[tokio::test]
+async fn cli_status_reports_registrations_reachability_and_perms() {
+    let home = TempDir::new().unwrap();
+    let dir = home.path();
+
+    // With no registrations at all, status succeeds and says so.
+    let empty = run_cli(dir, &["status"]);
+    assert!(empty.status.success(), "status with no servers must succeed: {}", String::from_utf8_lossy(&empty.stderr));
+    assert!(stdout_of(&empty).contains("no servers"), "empty status must say no servers: {}", stdout_of(&empty));
+
+    // Register against a live server and set a channel perm.
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+    assert!(run_cli(dir, &["register", "--server", &url, "--username", "aaron", "--machine", "workstation"]).status.success());
+    assert!(run_cli(dir, &["perm", "set", "converse", "--server", &url, "--channel", "ops"]).status.success());
+
+    // Status shows the registration, reachability, and the perm table.
+    let up = run_cli(dir, &["status"]);
+    let text = stdout_of(&up);
+    assert!(up.status.success(), "status against a live server must succeed: {}", String::from_utf8_lossy(&up.stderr));
+    assert!(text.contains(&url) && text.contains("aaron/workstation"), "status must show the registration: {text}");
+    assert!(text.contains("reachable"), "status must report reachability: {text}");
+    assert!(text.contains("ops") && text.contains("converse"), "status must include the perm table: {text}");
+
+    // With the server down, status reports the failure and exits non-zero.
+    drop(server);
+    let down = run_cli(dir, &["status"]);
+    assert!(!down.status.success(), "status must exit non-zero when a server is unreachable");
+    assert!(stdout_of(&down).contains("unreachable"), "status must mark the dead server: {}", stdout_of(&down));
+}
+
 /// Fly.io (and every container platform) stops a machine with SIGTERM: the server must drain and
 /// exit cleanly (code 0) rather than ignore it and wait out the platform's kill timeout.
 #[cfg(unix)]

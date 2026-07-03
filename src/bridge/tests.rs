@@ -440,6 +440,40 @@ fn bridge_rejected_join_is_not_recorded() {
 }
 
 #[test]
+fn bridge_leave_channel_unsubscribes_without_disconnecting() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    // Join (confirmed) — the channel is recorded locally.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(1),
+        name: "join_channel".to_owned(),
+        args: json!({ "channel": "ops" }),
+    });
+    assert!(matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Join { .. }));
+    harness.core.handle_inbound("s1", ProtocolMessage::Joined { channel: "ops".to_owned() });
+    let _ = harness.to_mcp_rx.try_recv().unwrap();
+    assert!(harness.joined.lock().unwrap().contains("ops"));
+
+    // leave_channel emits the Leave frame and forgets the subscription (no resubscribe on reconnect).
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(2),
+        name: "leave_channel".to_owned(),
+        args: json!({ "channel": "ops" }),
+    });
+    assert!(
+        matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Leave { channel } if channel == "ops"),
+        "leave_channel must emit a Leave frame",
+    );
+    assert!(!harness.joined.lock().unwrap().contains("ops"), "the local subscription must be forgotten");
+
+    // The server's ack resolves the tool call.
+    harness.core.handle_inbound("s1", ProtocolMessage::Ack { detail: Some("ops".to_owned()) });
+    let result = harness.to_mcp_rx.try_recv().unwrap();
+    assert_eq!(result.get("id"), Some(&json!(2)));
+    assert!(result.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("left ops"));
+}
+
+#[test]
 fn bridge_link_state_changes_notify_the_session() {
     let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
 

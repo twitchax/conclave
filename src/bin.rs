@@ -84,6 +84,13 @@ async fn execute(cli: &Cli) -> Void {
         Command::Channel { command } => run_channel(dir, command).await,
         Command::Acl { command } => run_acl(dir, command).await,
         Command::Invite { command } => run_invite(dir, command).await,
+        Command::Status => run_status(dir).await,
+        Command::Send(args) => {
+            control::send_message(&args.server, &load_identity(dir)?, &cli_session(), &args.channel, &args.text).await?;
+            println!("✓ sent to {}", args.channel);
+            Ok(())
+        }
+        Command::Tail(args) => control::tail(&args.server, &load_identity(dir)?, &args.session.clone().unwrap_or_else(cli_session), &args.channel).await,
         Command::Who(args) => print_response(control::one_shot(&args.server, &load_identity(dir)?, &cli_session(), ProtocolMessage::Who { channel: args.channel.clone() }).await?),
         Command::Kick(args) => {
             admin_op(
@@ -121,6 +128,10 @@ async fn execute(cli: &Cli) -> Void {
         Command::Bans(args) => admin_op(dir, &args.server, AdminOp::BanList { channel: args.channel.clone() }).await,
         Command::User { command } => run_user(dir, command).await,
         Command::Skill(args) => run_skill(args),
+        Command::Completions { shell } => {
+            clap_complete::generate(*shell, &mut Cli::command(), "conclave", &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
@@ -301,12 +312,55 @@ fn run_perm(explicit: Option<&PathBuf>, command: &PermCommand) -> Void {
         }
         PermCommand::Show => {
             let config = identity::load_config(&dir)?;
-            println!("default: {}", level_token(config.default_permission));
-            for over in &config.overrides {
-                let scope = over.channel.clone().unwrap_or_else(|| "<whisper>".to_owned());
-                println!("{} {} -> {}", over.server, scope, level_token(over.level));
+            print_perm_table(&config);
+        }
+    }
+    Ok(())
+}
+
+/// Prints the resolved permission table (shared by `perm show` and `status`).
+fn print_perm_table(config: &identity::Config) {
+    println!("default: {}", level_token(config.default_permission));
+    for over in &config.overrides {
+        let scope = over.channel.clone().unwrap_or_else(|| "<whisper>".to_owned());
+        println!("{} {} -> {}", over.server, scope, level_token(over.level));
+    }
+}
+
+/// The `status` verb: registrations, per-server reachability probes, and the permission table.
+async fn run_status(explicit: Option<&PathBuf>) -> Void {
+    let dir = config_dir(explicit)?;
+    let config = identity::load_config(&dir)?;
+    if config.servers.is_empty() {
+        println!("no servers registered; run `conclave register --server <url> --username <you>`");
+        return Ok(());
+    }
+
+    let identity = load_identity(explicit)?;
+    let mut unreachable = 0_usize;
+    for reg in &config.servers {
+        // A `who` round-trip proves reachability AND that this key authenticates (bounded by the
+        // control-client timeouts), and yields the live-session count as a bonus.
+        match control::one_shot(&reg.url, &identity, &cli_session(), ProtocolMessage::Who { channel: None }).await {
+            Ok(ProtocolMessage::Presence { sessions, .. }) => {
+                println!("{}\t{}/{}\treachable ({} session(s) online)", reg.url, reg.username, reg.machine, sessions.len());
+            }
+            Ok(other) => {
+                println!("{}\t{}/{}\tunreachable: unexpected response {other:?}", reg.url, reg.username, reg.machine);
+                unreachable += 1;
+            }
+            Err(err) => {
+                println!("{}\t{}/{}\tunreachable: {err:#}", reg.url, reg.username, reg.machine);
+                unreachable += 1;
             }
         }
+    }
+
+    println!();
+    print_perm_table(&config);
+
+    if unreachable > 0 {
+        anyhow::bail!("{unreachable} server(s) unreachable");
     }
     Ok(())
 }
@@ -538,6 +592,12 @@ enum Command {
         #[command(subcommand)]
         command: InviteCommand,
     },
+    /// Show this machine's registrations, server reachability, and the permission table.
+    Status,
+    /// Post one message to a channel from the command line.
+    Send(SendArgs),
+    /// Stream a channel's traffic to the terminal until Ctrl-C.
+    Tail(TailArgs),
     /// List presence on a server or within a channel.
     Who(WhoArgs),
     /// Kick a live session or user from a channel.
@@ -555,6 +615,11 @@ enum Command {
     },
     /// Print or install the packaged Claude Code skill (the whole-CLI guide).
     Skill(SkillArgs),
+    /// Generate shell completions (bash, zsh, fish, elvish, powershell).
+    Completions {
+        /// The shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
 }
 
 #[cfg(test)]
@@ -572,6 +637,9 @@ impl Command {
             Command::Channel { .. } => "channel",
             Command::Acl { .. } => "acl",
             Command::Invite { .. } => "invite",
+            Command::Status => "status",
+            Command::Send(_) => "send",
+            Command::Tail(_) => "tail",
             Command::Who(_) => "who",
             Command::Kick(_) => "kick",
             Command::Ban(_) => "ban",
@@ -579,6 +647,7 @@ impl Command {
             Command::Bans(_) => "bans",
             Command::User { .. } => "user",
             Command::Skill(_) => "skill",
+            Command::Completions { .. } => "completions",
         }
     }
 }
@@ -644,7 +713,7 @@ enum MachineCommand {
         /// Unique name for the machine within your user.
         #[arg(long)]
         name: String,
-        /// The new machine's public key (PEM), from `conclave key`.
+        /// The new machine's public key (base64url), as printed by `conclave key` on that machine.
         #[arg(long)]
         pubkey: String,
     },
@@ -850,6 +919,33 @@ struct BanArgs {
     channel: String,
     /// Username to ban.
     user: String,
+}
+
+/// Arguments for `send` (post one message from the command line).
+#[derive(Args, Debug)]
+struct SendArgs {
+    /// Server hosting the channel.
+    #[arg(long)]
+    server: String,
+    /// Channel to post to.
+    #[arg(long)]
+    channel: String,
+    /// The message text.
+    text: String,
+}
+
+/// Arguments for `tail` (stream a channel to the terminal).
+#[derive(Args, Debug)]
+struct TailArgs {
+    /// Server hosting the channel.
+    #[arg(long)]
+    server: String,
+    /// Channel to stream.
+    #[arg(long)]
+    channel: String,
+    /// Session handle for the tail connection (defaults to a per-process handle).
+    #[arg(long = "as")]
+    session: Option<String>,
 }
 
 /// Arguments for `bans` (list a channel's banned users).

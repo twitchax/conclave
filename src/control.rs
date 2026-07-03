@@ -25,6 +25,8 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// the connect + WS upgrade, and a bound on each wait for a server reply.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+/// `tail` keepalive cadence — comfortably inside the server's 60s idle-reap window.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Claims a username + enrolls this machine on `url`, returning the resolved session path.
 ///
@@ -68,9 +70,102 @@ pub async fn register(url: &str, identity: &Identity, username: &str, machine: &
 /// request itself is returned as a [`ProtocolMessage::Error`] value (not an `Err`).
 pub async fn one_shot(url: &str, identity: &Identity, session: &str, request: ProtocolMessage) -> Res<ProtocolMessage> {
     let mut ws = connect(url).await?;
-    let nonce = hello_challenge(&mut ws, session).await?;
+    authenticate(&mut ws, identity, session).await?;
+    send(&mut ws, &request).await?;
+    recv(&mut ws).await
+}
+
+/// Joins `channel` and posts one message as the authenticated session, awaiting the server's ack
+/// (sends are server-confirmed) — the CLI-as-a-human-client post (PRD-0011 T-004).
+///
+/// # Errors
+///
+/// Returns an error if the connection, authentication, join, or send is rejected or times out.
+pub async fn send_message(url: &str, identity: &Identity, session: &str, channel: &str, text: &str) -> Res<()> {
+    let mut ws = connect(url).await?;
+    let from = authenticate(&mut ws, identity, session).await?;
+
+    send(&mut ws, &ProtocolMessage::Join { channel: channel.to_owned(), token: None }).await?;
+    match recv(&mut ws).await? {
+        ProtocolMessage::Joined { .. } => {}
+        ProtocolMessage::Error(err) => anyhow::bail!("join rejected: {err}"),
+        other => anyhow::bail!("unexpected response to join: {other:?}"),
+    }
+
     send(
         &mut ws,
+        &ProtocolMessage::ChannelMsg {
+            channel: channel.to_owned(),
+            from,
+            payload: protocol::Payload::Plain(text.to_owned()),
+        },
+    )
+    .await?;
+    match recv(&mut ws).await? {
+        ProtocolMessage::Ack { .. } => Ok(()),
+        ProtocolMessage::Error(err) => anyhow::bail!("send rejected: {err}"),
+        other => anyhow::bail!("unexpected response to send: {other:?}"),
+    }
+}
+
+/// Joins `channel` and streams its traffic to stdout until Ctrl-C — the minimal human "watch the
+/// agents talk" view (PRD-0011 T-004; the §19 aggregation log's smallest sibling). App-level pings
+/// keep the session inside the server's idle-reap window.
+///
+/// # Errors
+///
+/// Returns an error if the connection, authentication, or join fails, or the link drops.
+pub async fn tail(url: &str, identity: &Identity, session: &str, channel: &str) -> Res<()> {
+    use std::io::Write as _;
+
+    let mut ws = connect(url).await?;
+    let path = authenticate(&mut ws, identity, session).await?;
+
+    send(&mut ws, &ProtocolMessage::Join { channel: channel.to_owned(), token: None }).await?;
+    match recv(&mut ws).await? {
+        ProtocolMessage::Joined { channel } => {
+            // Announce readiness (and flush: stdout is block-buffered when piped).
+            let mut out = std::io::stdout();
+            writeln!(out, "tailing #{channel} as {path} — Ctrl-C to stop")?;
+            out.flush()?;
+        }
+        ProtocolMessage::Error(err) => anyhow::bail!("join rejected: {err}"),
+        other => anyhow::bail!("unexpected response to join: {other:?}"),
+    }
+
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = keepalive.tick() => send(&mut ws, &ProtocolMessage::Ping).await?,
+            frame = recv_frame(&mut ws) => {
+                let mut out = std::io::stdout();
+                match frame? {
+                    ProtocolMessage::ChannelMsg { channel, from, payload } => writeln!(out, "[{channel}] {from}: {}", render_payload(&payload))?,
+                    ProtocolMessage::Whisper { from, payload, .. } => writeln!(out, "[whisper] {from}: {}", render_payload(&payload))?,
+                    // Control frames (acks of our own pings etc.) are not part of the stream.
+                    _ => continue,
+                }
+                out.flush()?;
+            }
+        }
+    }
+}
+
+/// Renders a message payload for the terminal (plaintext in v1).
+fn render_payload(payload: &protocol::Payload) -> &str {
+    match payload {
+        protocol::Payload::Plain(text) => text,
+        protocol::Payload::Encrypted(_) => "<end-to-end-encrypted payload>",
+    }
+}
+
+/// Completes the challenge-response prologue, returning the session's established path.
+async fn authenticate(ws: &mut Ws, identity: &Identity, session: &str) -> Res<SessionPath> {
+    let nonce = hello_challenge(ws, session).await?;
+    send(
+        ws,
         &ProtocolMessage::Auth {
             pubkey: identity.public_key().to_vec(),
             signature: identity.sign(&nonce)?.to_vec(),
@@ -78,14 +173,11 @@ pub async fn one_shot(url: &str, identity: &Identity, session: &str, request: Pr
     )
     .await?;
 
-    match recv(&mut ws).await? {
-        ProtocolMessage::Established { .. } => {}
+    match recv(ws).await? {
+        ProtocolMessage::Established { path } => Ok(path),
         ProtocolMessage::Error(err) => anyhow::bail!("authentication rejected: {err}"),
         other => anyhow::bail!("unexpected response before request: {other:?}"),
     }
-
-    send(&mut ws, &request).await?;
-    recv(&mut ws).await
 }
 
 async fn connect(url: &str) -> Res<Ws> {

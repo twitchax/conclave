@@ -230,6 +230,7 @@ impl BridgeCore {
     fn dispatch_tool(&mut self, id: &Value, name: &str, args: &Value) {
         match name {
             "join_channel" => self.tool_join(id, args),
+            "leave_channel" => self.tool_leave(id, args),
             "send_channel" => self.tool_send(id, args),
             "whisper" => self.tool_whisper(id, args),
             "list_channels" => self.tool_list(id, args),
@@ -412,6 +413,25 @@ impl BridgeCore {
         // rejected join isn't pre-recorded, PRD-0008 T-003 #20) — waits for the server to confirm.
         self.defer(id, &server, None);
         self.send_to_server(&server, ProtocolMessage::Join { channel: channel.to_owned(), token });
+    }
+
+    /// Unsubscribes this session from a channel without disconnecting (PRD-0011 T-005). The local
+    /// record drops immediately — a Leave cannot fail server-side (it always acks) and forgetting it
+    /// up front also stops any reconnect from resubscribing.
+    fn tool_leave(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let Some(channel) = arg_str(args, "channel") else {
+            return self.send_mcp(mcp::tool_error_result(id, "`channel` is required"));
+        };
+
+        if let Some(handle) = self.servers.get(&server) {
+            handle.joined.lock().expect("joined mutex poisoned").remove(channel);
+        }
+        self.defer(id, &server, Some(format!("left {channel}")));
+        self.send_to_server(&server, ProtocolMessage::Leave { channel: channel.to_owned() });
     }
 
     fn tool_send(&mut self, id: &Value, args: &Value) {
@@ -648,7 +668,7 @@ impl BridgeCore {
     // -----------------------------------------------------------------------
 
     fn tools(&self) -> Vec<Tool> {
-        let mut tools = vec![join_channel_tool(), list_channels_tool(), who_tool(), submit_permission_tool(), set_perm_tool()];
+        let mut tools = vec![join_channel_tool(), leave_channel_tool(), list_channels_tool(), who_tool(), submit_permission_tool(), set_perm_tool()];
         if self.any_emit_allowed() {
             tools.push(send_channel_tool());
             tools.push(whisper_tool());
@@ -757,6 +777,21 @@ fn join_channel_tool() -> Tool {
                 "channel": { "type": "string", "description": "Channel name to join." },
                 "token": { "type": "string", "description": "Invite token, if the channel requires one." },
                 "perm": { "type": "string", "enum": ["mute", "notify", "converse", "act"], "description": "Autonomy level for this channel." }
+            },
+            "required": ["channel"]
+        }),
+    }
+}
+
+fn leave_channel_tool() -> Tool {
+    Tool {
+        name: "leave_channel",
+        description: "Unsubscribe this session from a channel (stays connected to the server).",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "Server URL (optional if only one is connected)." },
+                "channel": { "type": "string", "description": "Channel name to leave." }
             },
             "required": ["channel"]
         }),
