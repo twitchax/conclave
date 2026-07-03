@@ -18,7 +18,7 @@ use super::{BridgeCore, mcp::FromMcp, mcp::McpSink};
 use crate::{
     base::{PermissionLevel, SessionPath, Visibility},
     identity::{Config, PermissionOverride, ServerRegistration},
-    protocol::{AdminOp, Payload, ProtocolMessage},
+    protocol::{AdminOp, Payload, ProtocolError, ProtocolMessage},
 };
 
 use super::sink::{Injection, NotificationSink};
@@ -187,8 +187,8 @@ fn bridge_perm_send_is_allowed_at_converse() {
         args: json!({ "channel": "ops", "text": "deploying" }),
     });
 
-    let result = harness.to_mcp_rx.try_recv().unwrap();
-    assert_ne!(result.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+    // The send is deferred (no immediate MCP result) and reaches the server as a ChannelMsg.
+    assert!(harness.to_mcp_rx.try_recv().is_err(), "an allowed send defers its result until the server acks");
     match harness.to_server_rx.try_recv().unwrap() {
         ProtocolMessage::ChannelMsg { channel, payload, .. } => {
             assert_eq!(channel, "ops");
@@ -196,6 +196,11 @@ fn bridge_perm_send_is_allowed_at_converse() {
         }
         other => panic!("expected a ChannelMsg, got {other:?}"),
     }
+
+    // The server's Ack resolves the deferred tool call as a success.
+    harness.core.handle_inbound("s1", ProtocolMessage::Ack { detail: None });
+    let result = harness.to_mcp_rx.try_recv().unwrap();
+    assert_ne!(result.pointer("/result/isError").and_then(Value::as_bool), Some(true));
 }
 
 // -----------------------------------------------------------------------------
@@ -336,4 +341,67 @@ fn bridge_join_channel_tool_defers_then_resolves_on_the_ack() {
     let result = harness.to_mcp_rx.try_recv().unwrap();
     assert_eq!(result.get("id"), Some(&json!(9)));
     assert!(result.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("joined ops"));
+}
+
+// -----------------------------------------------------------------------------
+// PRD-0008 T-001 / T-002 — response correlation across sends and link churn.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn bridge_correlation_out_of_band_error_does_not_misroute_a_pending_tool() {
+    let mut harness = harness(make_config(PermissionLevel::Converse, vec![]));
+    // A whisper (deferred) then a who (deferred), in that order.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(1),
+        name: "whisper".to_owned(),
+        args: json!({ "target": "ghost/box/sess", "text": "hi" }),
+    });
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(2),
+        name: "who".to_owned(),
+        args: json!({}),
+    });
+
+    // The server responds in order: the whisper fails, then the who succeeds.
+    harness.core.handle_inbound("s1", ProtocolMessage::Error(ProtocolError::NotFound("ghost".to_owned())));
+    harness.core.handle_inbound("s1", ProtocolMessage::Presence { channel: None, sessions: vec![] });
+
+    // The error resolves the whisper (id 1); the presence resolves the who (id 2) — not swapped.
+    let first = harness.to_mcp_rx.try_recv().unwrap();
+    assert_eq!(first.get("id"), Some(&json!(1)));
+    assert_eq!(first.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+    let second = harness.to_mcp_rx.try_recv().unwrap();
+    assert_eq!(second.get("id"), Some(&json!(2)));
+    assert_ne!(second.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+}
+
+#[test]
+fn bridge_link_down_fails_pending_tool_calls() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(7),
+        name: "who".to_owned(),
+        args: json!({}),
+    });
+    assert!(harness.to_mcp_rx.try_recv().is_err(), "the who defers");
+
+    // The link drops before the server responds — the pending call is failed, not left to hang.
+    harness.core.link_down("s1");
+    let result = harness.to_mcp_rx.try_recv().unwrap();
+    assert_eq!(result.get("id"), Some(&json!(7)));
+    assert_eq!(result.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+}
+
+#[test]
+fn bridge_link_up_resubscribe_ack_is_consumed_silently() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    harness.joined.lock().unwrap().insert("ops".to_owned());
+
+    // On reconnect the dispatcher re-subscribes the joined channel...
+    harness.core.link_up("s1");
+    assert!(matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Join { channel, .. } if channel == "ops"));
+
+    // ...and its Joined ack is internal — it must not surface as a tool result.
+    harness.core.handle_inbound("s1", ProtocolMessage::Joined { channel: "ops".to_owned() });
+    assert!(harness.to_mcp_rx.try_recv().is_err(), "a re-subscribe Joined must not answer a tool call");
 }

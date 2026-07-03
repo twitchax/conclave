@@ -7,12 +7,7 @@
 //! closure so the loop is testable without a socket; the production step ([`connect_ws`]) dials a
 //! WebSocket and runs the challenge-response handshake.
 
-use std::{
-    collections::HashSet,
-    future::Future,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use futures_util::{SinkExt as _, StreamExt as _, stream::SplitSink};
@@ -40,6 +35,18 @@ pub(crate) struct LinkIo {
     pub from_server: mpsc::UnboundedReceiver<ProtocolMessage>,
 }
 
+/// An event on a server link, carried to the orchestrator over the shared inbound channel: link
+/// lifecycle plus each received frame. The lifecycle events let the dispatcher re-establish and fail
+/// pending request↔response correlation across reconnects (PRD-0008 T-001/T-002).
+pub(crate) enum LinkEvent {
+    /// A fresh connection is up — the orchestrator re-subscribes the joined channels.
+    Up,
+    /// The link dropped — the orchestrator fails this server's pending tool calls.
+    Down,
+    /// A protocol frame received from the server.
+    Frame(ProtocolMessage),
+}
+
 /// Exponential backoff with a cap, reset on a successful connect.
 struct Backoff {
     current: Duration,
@@ -65,8 +72,7 @@ impl Backoff {
 pub(crate) async fn run_link<C, Fut>(
     server: String,
     mut connect: C,
-    joined: Arc<Mutex<HashSet<String>>>,
-    inbound_tx: mpsc::UnboundedSender<(String, ProtocolMessage)>,
+    inbound_tx: mpsc::UnboundedSender<(String, LinkEvent)>,
     mut outbound_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     shutdown: Arc<Notify>,
 ) where
@@ -78,8 +84,11 @@ pub(crate) async fn run_link<C, Fut>(
         match connect().await {
             Ok(io) => {
                 backoff.reset();
-                resubscribe(&joined, &io.to_server);
+                // The orchestrator re-subscribes joined channels on `Up` and fails this server's
+                // pending tool calls on `Down`, so correlation survives reconnects (T-001/T-002).
+                let _ = inbound_tx.send((server.clone(), LinkEvent::Up));
                 outbound_rx = pump(server.clone(), io, inbound_tx.clone(), outbound_rx, &shutdown).await;
+                let _ = inbound_tx.send((server.clone(), LinkEvent::Down));
             }
             Err(err) => tracing::warn!(%server, error = %err, "server connect failed; will retry"),
         }
@@ -91,19 +100,12 @@ pub(crate) async fn run_link<C, Fut>(
     }
 }
 
-/// Re-issues a `Join` for every currently-joined channel on a fresh connection (DESIGN.md §16).
-fn resubscribe(joined: &Arc<Mutex<HashSet<String>>>, to_server: &mpsc::UnboundedSender<ProtocolMessage>) {
-    for channel in joined.lock().expect("joined mutex poisoned").iter() {
-        let _ = to_server.send(ProtocolMessage::Join { channel: channel.clone(), token: None });
-    }
-}
-
 /// Shuttles frames between the server link and the orchestrator until either side closes, returning
 /// the outbound receiver so the next reconnect can reuse it.
 async fn pump(
     server: String,
     mut io: LinkIo,
-    inbound_tx: mpsc::UnboundedSender<(String, ProtocolMessage)>,
+    inbound_tx: mpsc::UnboundedSender<(String, LinkEvent)>,
     mut outbound_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     shutdown: &Arc<Notify>,
 ) -> mpsc::UnboundedReceiver<ProtocolMessage> {
@@ -112,7 +114,7 @@ async fn pump(
             () = shutdown.notified() => break,
             frame = io.from_server.recv() => {
                 let Some(frame) = frame else { break };
-                if inbound_tx.send((server.clone(), frame)).is_err() {
+                if inbound_tx.send((server.clone(), LinkEvent::Frame(frame))).is_err() {
                     break;
                 }
             }
@@ -261,7 +263,10 @@ mod tests {
 
         // Server → orchestrator: a frame from the link is tagged with the server name.
         from_tx.send(ProtocolMessage::Pong).unwrap();
-        assert_eq!(inbound_rx.recv().await, Some(("s1".to_owned(), ProtocolMessage::Pong)));
+        match inbound_rx.recv().await {
+            Some((server, LinkEvent::Frame(ProtocolMessage::Pong))) => assert_eq!(server, "s1"),
+            _ => panic!("expected a forwarded Pong frame tagged with the server name"),
+        }
 
         // Orchestrator → server: an outbound frame reaches the link.
         outbound_tx.send(ProtocolMessage::Ping).unwrap();
@@ -272,9 +277,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bridge_reconnect_retries_then_resubscribes_joined_channels() {
-        let joined = Arc::new(Mutex::new(HashSet::from(["ops".to_owned()])));
-        let (inbound_tx, _inbound_rx) = mpsc::unbounded_channel();
+    async fn bridge_reconnect_retries_then_signals_link_up() {
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
         let (_outbound_tx, outbound_rx) = mpsc::unbounded_channel::<ProtocolMessage>();
         let shutdown = Arc::new(Notify::new());
         let (capture_tx, mut capture_rx) = mpsc::unbounded_channel();
@@ -298,23 +302,23 @@ mod tests {
             }
         };
 
-        let handle = tokio::spawn(run_link("s1".to_owned(), connect, joined, inbound_tx, outbound_rx, Arc::clone(&shutdown)));
+        let handle = tokio::spawn(run_link("s1".to_owned(), connect, inbound_tx, outbound_rx, Arc::clone(&shutdown)));
 
         // Drive the two backoff sleeps forward until the third (successful) attempt captures a link.
-        let mut to_rx = loop {
+        loop {
             for _ in 0..5 {
                 tokio::task::yield_now().await;
             }
-            if let Ok(rx) = capture_rx.try_recv() {
-                break rx;
+            if capture_rx.try_recv().is_ok() {
+                break;
             }
             tokio::time::advance(Duration::from_secs(60)).await;
-        };
+        }
 
-        // The successful connect re-subscribed the joined channel.
-        match to_rx.recv().await {
-            Some(ProtocolMessage::Join { channel, .. }) => assert_eq!(channel, "ops"),
-            other => panic!("expected a re-subscribe Join, got {other:?}"),
+        // A successful (re)connect signals `Up` to the orchestrator, which then re-subscribes.
+        match inbound_rx.recv().await {
+            Some((server, LinkEvent::Up)) => assert_eq!(server, "s1"),
+            _ => panic!("expected a LinkEvent::Up from the successful reconnect"),
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
 

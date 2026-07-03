@@ -264,16 +264,24 @@ async fn handle_frame(hub: &Arc<Hub>, ctx: &SessionCtx, outbound: &Outbound, fra
             }
         },
         // The client-supplied `from` is ignored; the server stamps the authenticated path (§12).
-        ProtocolMessage::ChannelMsg { channel, payload, .. } => {
-            if let Err(e) = hub.post(&ctx.path, &channel, payload) {
+        // Success is acked so the sender's deferred tool call resolves and its errors correlate
+        // (PRD-0008 T-001); the ack is not fanned out to other subscribers.
+        ProtocolMessage::ChannelMsg { channel, payload, .. } => match hub.post(&ctx.path, &channel, payload) {
+            Ok(()) => {
+                let _ = outbound.send(ProtocolMessage::Ack { detail: None });
+            }
+            Err(e) => {
                 let _ = outbound.send(err(e));
             }
-        }
-        ProtocolMessage::Whisper { target, payload, .. } => {
-            if let Err(e) = hub.whisper(&ctx.path, &target, payload) {
+        },
+        ProtocolMessage::Whisper { target, payload, .. } => match hub.whisper(&ctx.path, &target, payload) {
+            Ok(()) => {
+                let _ = outbound.send(ProtocolMessage::Ack { detail: None });
+            }
+            Err(e) => {
                 let _ = outbound.send(err(e));
             }
-        }
+        },
         // Server→client frames (and the handshake frames) are never valid inbound mid-session.
         _ => {
             let _ = outbound.send(err(ProtocolError::MalformedFrame("unexpected frame from client".to_owned())));

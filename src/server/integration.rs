@@ -731,6 +731,9 @@ async fn server_fanout_whisper_reaches_exactly_one_session() {
         other => panic!("expected a Whisper, got {other:?}"),
     }
 
+    // The successful whisper is acked back to the sender (PRD-0008 T-001).
+    assert!(matches!(a.recv().await, ProtocolMessage::Ack { .. }), "a successful whisper must be acked to the sender");
+
     // C — a third live session — receives nothing.
     assert!(c.try_recv().await.is_none(), "a whisper must not reach a third session");
 

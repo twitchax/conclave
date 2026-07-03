@@ -89,7 +89,7 @@ pub async fn run(setup: BridgeSetup) -> Void {
             let session = session.clone();
             async move { client::connect_ws(&url, &identity, &session).await }
         };
-        tokio::spawn(client::run_link(registration.url.clone(), connect, joined, inbound_tx.clone(), out_rx, Arc::clone(&shutdown)));
+        tokio::spawn(client::run_link(registration.url.clone(), connect, inbound_tx.clone(), out_rx, Arc::clone(&shutdown)));
         spawn_keepalive(out_tx, Arc::clone(&shutdown));
     }
 
@@ -131,6 +131,17 @@ struct ServerHandle {
     joined: Arc<Mutex<HashSet<String>>>,
 }
 
+/// One entry in a server's in-order response queue. Every server-bound request that expects a
+/// response enqueues one, so the FIFO stays correctly correlated (PRD-0008 T-001).
+enum Pending {
+    /// A deferred MCP tool call awaiting the server's response. `ok` overrides the success text
+    /// (used by send/whisper, whose `Ack` carries no useful detail); `None` uses the frame's own
+    /// rendered content (join / list / who / invite / admin).
+    Tool { id: Value, ok: Option<String> },
+    /// An internal re-subscribe `Join` issued on reconnect — its `Joined` ack is consumed silently.
+    Resubscribe,
+}
+
 /// The transport-free bridge dispatcher: MCP events and inbound server frames in, MCP responses /
 /// injections / outbound frames out. Everything I/O lives in [`run`]; this is unit-testable.
 struct BridgeCore {
@@ -139,8 +150,8 @@ struct BridgeCore {
     to_mcp: mpsc::UnboundedSender<Value>,
     sink: Box<dyn NotificationSink>,
     servers: HashMap<String, ServerHandle>,
-    /// Per-server FIFO of MCP request ids awaiting a control response (join / list / who / admin).
-    pending: HashMap<String, VecDeque<Value>>,
+    /// Per-server in-order queue of responses awaited from that server (tool calls + re-subscribes).
+    pending: HashMap<String, VecDeque<Pending>>,
     /// Servers on which the authenticated user is an admin (from `ServerInfo`) — gates admin tools.
     admin_servers: HashSet<String>,
 }
@@ -163,7 +174,7 @@ impl BridgeCore {
     }
 
     /// The dispatcher loop: MCP events, inbound server frames, and Ctrl-C / stdin-EOF shutdown.
-    async fn run(mut self, mut from_mcp: mpsc::UnboundedReceiver<FromMcp>, mut inbound: mpsc::UnboundedReceiver<(String, ProtocolMessage)>, shutdown: Arc<Notify>) -> Void {
+    async fn run(mut self, mut from_mcp: mpsc::UnboundedReceiver<FromMcp>, mut inbound: mpsc::UnboundedReceiver<(String, client::LinkEvent)>, shutdown: Arc<Notify>) -> Void {
         loop {
             tokio::select! {
                 () = shutdown.notified() => break,
@@ -172,14 +183,23 @@ impl BridgeCore {
                     Some(event) => self.handle_mcp(event),
                     None => break,
                 },
-                frame = inbound.recv() => match frame {
-                    Some((server, frame)) => self.handle_inbound(&server, frame),
+                event = inbound.recv() => match event {
+                    Some((server, event)) => self.handle_link_event(&server, event),
                     None => break,
                 },
             }
         }
         shutdown.notify_waiters();
         Ok(())
+    }
+
+    /// Routes a link event: lifecycle (re-subscribe on `Up`, fail pending on `Down`) or a frame.
+    fn handle_link_event(&mut self, server: &str, event: client::LinkEvent) {
+        match event {
+            client::LinkEvent::Up => self.link_up(server),
+            client::LinkEvent::Down => self.link_down(server),
+            client::LinkEvent::Frame(frame) => self.handle_inbound(server, frame),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -227,8 +247,14 @@ impl BridgeCore {
 
     /// Pushes an admin op to the server, deferring its MCP result to the `Ack` / `InviteToken` /
     /// `Error` response. The server authorizes by role, so a non-admin call is refused server-side.
+    /// Enqueues a deferred tool call awaiting `server`'s response. `ok` overrides the success text
+    /// (`None` uses the response frame's own content).
+    fn defer(&mut self, id: &Value, server: &str, ok: Option<String>) {
+        self.pending.entry(server.to_owned()).or_default().push_back(Pending::Tool { id: id.clone(), ok });
+    }
+
     fn defer_admin(&mut self, id: &Value, server: &str, op: AdminOp) {
-        self.pending.entry(server.to_owned()).or_default().push_back(id.clone());
+        self.defer(id, server, None);
         self.send_to_server(server, ProtocolMessage::Admin(op));
     }
 
@@ -377,7 +403,7 @@ impl BridgeCore {
             handle.joined.lock().expect("joined mutex poisoned").insert(channel.to_owned());
         }
         // Deferred: the result is sent when the server's `Joined` / `Error` arrives.
-        self.pending.entry(server.clone()).or_default().push_back(id.clone());
+        self.defer(id, &server, None);
         self.send_to_server(&server, ProtocolMessage::Join { channel: channel.to_owned(), token });
     }
 
@@ -396,6 +422,9 @@ impl BridgeCore {
         }
 
         let from = self.our_path(&server);
+        // Deferred until the server confirms (Ack) or rejects (Error), so the result reflects real
+        // delivery and its Error correlates instead of stealing another call's slot (T-001).
+        self.defer(id, &server, Some(format!("sent to {channel}")));
         self.send_to_server(
             &server,
             ProtocolMessage::ChannelMsg {
@@ -404,7 +433,6 @@ impl BridgeCore {
                 payload: Payload::Plain(text.to_owned()),
             },
         );
-        self.send_mcp(mcp::tool_text_result(id, &format!("sent to {channel}")));
     }
 
     fn tool_whisper(&mut self, id: &Value, args: &Value) {
@@ -424,6 +452,9 @@ impl BridgeCore {
         }
 
         let from = self.our_path(&server);
+        // Deferred until the server confirms/rejects — a whisper to an offline target now returns
+        // that error to the caller instead of misrouting it to another pending call (T-001).
+        self.defer(id, &server, Some("whisper sent".to_owned()));
         self.send_to_server(
             &server,
             ProtocolMessage::Whisper {
@@ -432,7 +463,6 @@ impl BridgeCore {
                 payload: Payload::Plain(text.to_owned()),
             },
         );
-        self.send_mcp(mcp::tool_text_result(id, "whisper sent"));
     }
 
     fn tool_list(&mut self, id: &Value, args: &Value) {
@@ -440,7 +470,7 @@ impl BridgeCore {
             Ok(server) => server,
             Err(error) => return self.send_mcp(error),
         };
-        self.pending.entry(server.clone()).or_default().push_back(id.clone());
+        self.defer(id, &server, None);
         self.send_to_server(&server, ProtocolMessage::ListChannels);
     }
 
@@ -450,7 +480,7 @@ impl BridgeCore {
             Err(error) => return self.send_mcp(error),
         };
         let channel = arg_str(args, "channel").map(str::to_owned);
-        self.pending.entry(server.clone()).or_default().push_back(id.clone());
+        self.defer(id, &server, None);
         self.send_to_server(&server, ProtocolMessage::Who { channel });
     }
 
@@ -544,20 +574,47 @@ impl BridgeCore {
     }
 
     fn resolve_pending(&mut self, server: &str, text: &str) {
-        if let Some(id) = self.pending.get_mut(server).and_then(VecDeque::pop_front) {
-            self.send_mcp(mcp::tool_text_result(&id, text));
+        match self.pending.get_mut(server).and_then(VecDeque::pop_front) {
+            Some(Pending::Tool { id, ok }) => self.send_mcp(mcp::tool_text_result(&id, ok.as_deref().unwrap_or(text))),
+            // A re-subscribe `Joined` ack (or an orphan success) — consume it, don't answer a tool.
+            Some(Pending::Resubscribe) | None => {}
         }
     }
 
     fn resolve_error(&mut self, server: &str, error: &ProtocolError) {
-        if let Some(id) = self.pending.get_mut(server).and_then(VecDeque::pop_front) {
-            self.send_mcp(mcp::tool_error_result(&id, &error.to_string()));
-        } else {
-            // A stray error (e.g. a whisper to an offline target) — surface it as a notice.
-            let mut meta = std::collections::BTreeMap::new();
-            meta.insert("server".to_owned(), server.to_owned());
-            meta.insert("kind".to_owned(), "error".to_owned());
-            self.send_mcp(mcp::channel_notification(&format!("Server `{server}` error: {error}"), &meta));
+        match self.pending.get_mut(server).and_then(VecDeque::pop_front) {
+            Some(Pending::Tool { id, .. }) => self.send_mcp(mcp::tool_error_result(&id, &error.to_string())),
+            // A re-subscribe `Join` that failed (e.g. the channel was deleted) — consume silently.
+            Some(Pending::Resubscribe) => {}
+            None => {
+                // A stray error with nothing pending — surface it as a notice.
+                let mut meta = std::collections::BTreeMap::new();
+                meta.insert("server".to_owned(), server.to_owned());
+                meta.insert("kind".to_owned(), "error".to_owned());
+                self.send_mcp(mcp::channel_notification(&format!("Server `{server}` error: {error}"), &meta));
+            }
+        }
+    }
+
+    /// On a fresh connection, re-subscribe every joined channel, enqueuing a silent `Resubscribe`
+    /// per `Join` so its `Joined` ack never resolves an unrelated tool call (PRD-0008 T-001).
+    fn link_up(&mut self, server: &str) {
+        let Some(handle) = self.servers.get(server) else { return };
+        let channels: Vec<String> = handle.joined.lock().expect("joined mutex poisoned").iter().cloned().collect();
+        for channel in channels {
+            self.pending.entry(server.to_owned()).or_default().push_back(Pending::Resubscribe);
+            self.send_to_server(server, ProtocolMessage::Join { channel, token: None });
+        }
+    }
+
+    /// On a link drop, fail every pending tool call for `server` (so a deferred call never hangs);
+    /// re-subscribe entries are simply dropped (PRD-0008 T-002).
+    fn link_down(&mut self, server: &str) {
+        let Some(queue) = self.pending.remove(server) else { return };
+        for entry in queue {
+            if let Pending::Tool { id, .. } = entry {
+                self.send_mcp(mcp::tool_error_result(&id, &format!("connection to `{server}` lost; retry")));
+            }
         }
     }
 
