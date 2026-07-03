@@ -8,6 +8,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-03
+
+The post-v0.1.0 adversarial review (42 agents, 28 confirmed findings) driven to zero, plus
+everything needed to deploy: TLS clients, a container image, and Fly.io wiring.
+
+### Added
+
+- **TLS + deployment (PRD-0009).** The bridge and CLI dial `wss://` (bundled Mozilla roots — no
+  system cert store needed in containers); a cargo-chef multi-stage `Dockerfile` (slim, non-root)
+  and `fly.toml` with a mounted-volume store; a `/health` endpoint for platform checks; env-driven
+  serve config (`CONCLAVE_BIND` / `CONCLAVE_DATA_DIR` / `CONCLAVE_ADMINS`) with an explicit
+  `--ephemeral` guard so a mis-templated deploy can't silently run in-memory; and tag-triggered
+  release automation (a `v*` tag builds the platform matrix and publishes a GitHub Release).
+- **SIGTERM graceful drain.** The server now drains on SIGTERM (what `fly deploy` / `docker stop`
+  send), not just Ctrl-C — deploys stop cleanly instead of waiting out the kill timeout.
+- **Durable channel bans.** Bans persist in the store (write-through to an in-memory mirror) and
+  survive a server restart; they cascade on channel delete and follow renames.
+- **Link-state notices.** The bridge surfaces a disconnect notice once per drop and announces the
+  reconnect, so a session knows when its server link is down.
+
+### Changed
+
+- **Confirmed sends (PRD-0008).** `send_channel` / `whisper` now defer until the server acks, so
+  the tool result reflects real delivery — a whisper to an offline target reports the error to the
+  caller instead of claiming success.
+- **Reconnect supersede.** A fresh authenticated session for the same path takes over immediately
+  after an ungraceful drop, instead of colliding with the stale one until the idle reaper (~75s).
+- **Explicit `perm set` scope.** `--server` now requires `--channel <name>` or `--whisper`
+  (previously it silently wrote the whisper scope).
+
+### Fixed
+
+- **Bridge response correlation (PRD-0008, HIGH).** Out-of-band `Error` frames no longer steal an
+  unrelated deferred tool call's response slot, and a link drop fails all pending tool calls
+  instead of hanging them forever; reconnect re-subscribes are consumed silently.
+- **Server hardening (PRD-0007).** Registration is verify-first (a failed possession proof
+  persists nothing); channel ACLs normalized into a membership table (no lost updates under
+  SurrealKV's optimistic concurrency); per-session outbound queues are bounded with a
+  slow-consumer disconnect; handshake timeout and frame-size caps against pre-auth DoS; admin
+  usernames pin to keys (anti-squat); visibility-uniform errors so private channels don't leak
+  existence (including the invite-revoke oracle and a ban/join race).
+- **Injection framing escape (security).** Inbound message bodies are XML-escaped so a sender
+  cannot close the `<channel>`/`<whisper>` frame and forge a trusted block in the agent session.
+- **CLI robustness.** Control verbs time out against a dead-but-listening server; `config.toml`
+  writes are atomic (temp + rename); a rejected `join --perm` no longer leaves a stale permission
+  override; keyfiles are created `0600` from the start and transient seed copies are zeroized.
+
 ## [0.1.0] - 2026-07-02
 
 ### Added
