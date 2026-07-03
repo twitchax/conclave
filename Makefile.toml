@@ -212,3 +212,12 @@ cwd = "."
 workspace = false
 command = "cargo"
 args = ["clean"]
+
+# Live deploy smoke (PRD-0009 uat-005): drives two real bridges against a deployed server.
+# Usage: CONCLAVE_SMOKE_SERVER=wss://your-app.fly.dev cargo make uat-deploy-smoke
+[tasks.uat-deploy-smoke]
+cwd = "."
+workspace = false
+dependencies = ["build-release"]
+command = "python3"
+args = ["scripts/live-smoke.py"]
