@@ -145,8 +145,28 @@ async fn handle_ws(hub: Arc<Hub>, socket: WebSocket) {
     let _ = write_task.await;
 }
 
-/// Resolves when the process receives Ctrl-C, driving the graceful shutdown.
+/// Resolves when the process receives Ctrl-C or SIGTERM, driving the graceful shutdown. SIGTERM is
+/// what container platforms (Fly.io, `docker stop`) send on deploy/stop — without handling it the
+/// server ignores the signal, waits out the platform's kill timeout, and dies un-drained.
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(sigterm) => sigterm,
+            Err(error) => {
+                tracing::error!(%error, "failed to install the SIGTERM handler; falling back to Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("shutdown signal received; draining connections");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+
     tracing::info!("shutdown signal received; draining connections");
 }

@@ -203,6 +203,40 @@ async fn e2e_serve_health_endpoint_returns_ok() {
     assert!(response.trim_end().ends_with("ok"), "health check body must be `ok`, got: {response:?}");
 }
 
+/// Fly.io (and every container platform) stops a machine with SIGTERM: the server must drain and
+/// exit cleanly (code 0) rather than ignore it and wait out the platform's kill timeout.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_serve_drains_gracefully_on_sigterm() {
+    let data_dir = TempDir::new().unwrap();
+    let addr = free_loopback_addr();
+    let mut server = ServerProcess(
+        Command::new(CONCLAVE_BIN)
+            .args(["serve", "--bind", &addr.to_string(), "--data-dir", data_dir.path().to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn `conclave serve`"),
+    );
+    wait_for_listener(addr).await;
+
+    // Deliver SIGTERM (what `fly deploy` / `docker stop` send).
+    let pid = server.0.id().to_string();
+    assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+
+    // The server must exit promptly and cleanly — a signal-terminated process has no exit code.
+    let status = 'wait: {
+        for _ in 0..100 {
+            if let Some(status) = server.0.try_wait().unwrap() {
+                break 'wait status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("server did not exit within 5s of SIGTERM");
+    };
+    assert_eq!(status.code(), Some(0), "SIGTERM must drain gracefully (exit 0), not kill the process: {status:?}");
+}
+
 /// Reserves an ephemeral loopback port (staggered ports, DESIGN.md §17) and frees it for the server.
 fn free_loopback_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
