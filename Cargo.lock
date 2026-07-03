@@ -715,6 +715,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "gethostname",
+ "libc",
  "pretty_assertions",
  "ring",
  "rustls",

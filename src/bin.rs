@@ -28,6 +28,13 @@ use tracing::error;
 async fn main() {
     let cli = Cli::parse();
 
+    // One-shot CLI verbs behave like any Unix CLI in a pipeline: die quietly on SIGPIPE instead of
+    // panicking on BrokenPipe (Rust ignores SIGPIPE by default). The long-running verbs keep the
+    // ignore disposition — serve/bridge handle write errors on their graceful shutdown paths.
+    if !matches!(cli.command, Command::Serve(_) | Command::Bridge(_)) {
+        restore_default_sigpipe();
+    }
+
     let directive = log_directive(cli.verbose, std::env::var("RUST_LOG").ok().as_deref());
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -43,6 +50,19 @@ async fn main() {
         std::process::exit(1);
     }
 }
+
+/// Restores the default SIGPIPE disposition (terminate) so pipeline writes end the process quietly.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: `signal(2)` with `SIG_DFL` has no preconditions; called once at startup before any
+    // I/O the disposition could affect.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
 
 /// The tracing filter directive: `RUST_LOG` if set and non-empty, else `debug` when `-v`, else
 /// `info`. Keeping log level in the environment suits production / container deploys (PRD-0009 T-005).

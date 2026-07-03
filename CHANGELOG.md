@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file 
 
 ## [Unreleased]
 
+### Fixed
+
+- One-shot CLI verbs now die quietly on SIGPIPE (e.g. `conclave completions bash | head`) instead
+  of panicking with `BrokenPipe`; `serve`/`bridge` keep their graceful write-error shutdown paths.
+
 ## [0.2.1] - 2026-07-03
 
 CLI ergonomics and operator visibility (PRD-0011), driven by findings from live deployment testing.

@@ -70,6 +70,11 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter"] }
 
+# One-shot CLI verbs restore the default SIGPIPE disposition so `conclave … | head` dies quietly
+# like any Unix CLI instead of panicking on BrokenPipe (PRD-0011 follow-up).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"

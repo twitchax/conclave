@@ -203,6 +203,26 @@ async fn e2e_serve_health_endpoint_returns_ok() {
     assert!(response.trim_end().ends_with("ok"), "health check body must be `ok`, got: {response:?}");
 }
 
+/// A CLI verb piped into a short-reading consumer (`conclave completions bash | head`) must die
+/// quietly on SIGPIPE like every Unix CLI — not panic with `BrokenPipe` (found in live testing; Rust
+/// ignores SIGPIPE by default). Long-running verbs (serve/bridge) keep the graceful error path.
+#[cfg(unix)]
+#[test]
+fn e2e_cli_dies_quietly_on_a_broken_pipe() {
+    // The completions output (~87KB) exceeds the 64KiB pipe buffer, so the writer is still writing
+    // when `head` exits — EPIPE is guaranteed, not racy.
+    let output = Command::new("bash")
+        .args(["-c", &format!("'{CONCLAVE_BIN}' completions bash | head -c 16 > /dev/null; echo \"code=${{PIPESTATUS[0]}}\"")])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!stderr.contains("panicked"), "a broken pipe must not panic: {stderr}");
+    // 141 = 128 + SIGPIPE(13): killed by the default signal disposition.
+    assert!(stdout.contains("code=141"), "the writer should die of SIGPIPE (141), got: {stdout}");
+}
+
 #[test]
 fn e2e_completions_generate_for_common_shells() {
     for shell in ["bash", "zsh", "fish"] {
