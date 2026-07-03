@@ -151,7 +151,8 @@ impl Hub {
         Ok((machine.user, machine.name))
     }
 
-    /// Registers a live session and returns its kill handle, rejecting a duplicate live path (§5).
+    /// Registers a live session and returns its kill handle, superseding any prior session on the
+    /// same path so a half-open reconnect takes over immediately (§5, #16).
     pub(crate) fn attach(&self, path: &SessionPath, user: &str, machine: &str, outbound: Outbound) -> Arc<Notify> {
         let mut st = self.state();
         // A fresh authenticated session for this path supersedes any prior one, so a reconnect after
@@ -244,7 +245,10 @@ impl Hub {
             }
         }
 
-        self.subscribe(path, channel);
+        // The subscribe re-checks the ban atomically; a ban that raced this join wins (#30).
+        if !self.subscribe(path, channel) {
+            return Err(AclError::ChannelPrivate(channel.to_owned()).into());
+        }
         Ok(())
     }
 
@@ -398,8 +402,11 @@ impl Hub {
                 Ok(ProtocolMessage::InviteToken { token })
             }
             AdminOp::InviteRevoke { token } => {
-                if let Some(invite) = self.store.get_invite(&token).await.map_err(internal)? {
-                    self.authorize_channel_admin(&invite.channel, user).await?;
+                // Uniform ack whether or not the token exists, so a non-admin cannot use revoke as an
+                // existence oracle for tokens (#29): only the channel's admin actually deletes.
+                if let Some(invite) = self.store.get_invite(&token).await.map_err(internal)?
+                    && self.is_channel_admin(&invite.channel, user).await
+                {
                     self.store.delete_invite(&token).await.map_err(internal)?;
                 }
                 Ok(ack(token))
@@ -473,6 +480,15 @@ impl Hub {
         }
     }
 
+    /// Whether `user` administers `channel` (its creator or a server admin) — a boolean check that
+    /// never errors, so a caller can gate silently without leaking the channel's existence (#29).
+    async fn is_channel_admin(&self, channel: &str, user: &str) -> bool {
+        match self.store.get_channel(channel).await {
+            Ok(Some(record)) => record.created_by == user || self.is_admin(user),
+            _ => false,
+        }
+    }
+
     async fn redeem_invite(&self, channel: &str, token: &str) -> Result<(), ProtocolError> {
         // An invalid / wrong-channel / expired / spent token is refused as `not found`, matching an
         // absent channel so a private channel's existence never leaks (finding #12).
@@ -501,13 +517,20 @@ impl Hub {
     // In-memory presence / subscription mutation (all lock-guarded, await-free).
     // -----------------------------------------------------------------------
 
-    fn subscribe(&self, path: &SessionPath, channel: &str) {
+    /// Subscribes a session to a channel; returns `false` (no-op) if the user is banned or the
+    /// session is gone. The ban is re-checked here under the same lock as the insert, so a ban that
+    /// lands between join's pre-check and this call cannot be bypassed (#30 TOCTOU).
+    fn subscribe(&self, path: &SessionPath, channel: &str) -> bool {
         let mut st = self.state();
+        if st.bans.get(channel).is_some_and(|banned| banned.contains(&path.user)) {
+            return false;
+        }
         let Some(entry) = st.sessions.get_mut(path) else {
-            return;
+            return false;
         };
         entry.channels.insert(channel.to_owned());
         st.subscriptions.entry(channel.to_owned()).or_default().insert(path.clone());
+        true
     }
 
     fn unsubscribe_session(&self, path: &SessionPath, channel: &str) {
@@ -722,6 +745,38 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(500), b_kill.notified()).await.is_ok(),
             "a consumer that fills its bounded queue must be force-dropped",
         );
+    }
+
+    #[tokio::test]
+    async fn invite_revoke_gives_a_uniform_ack_and_no_delete_for_non_admins() {
+        let hub = hub_with_private_channel(None, None).await; // channel `ops` (private), invite `tok`, admin `aaron`.
+
+        // A non-admin gets the same ack whether the token exists or not — no existence oracle (#29).
+        let existing = hub.admin("mallory", AdminOp::InviteRevoke { token: "tok".to_owned() }).await.unwrap();
+        let absent = hub.admin("mallory", AdminOp::InviteRevoke { token: "ghost".to_owned() }).await.unwrap();
+        assert!(
+            matches!(existing, ProtocolMessage::Ack { .. }),
+            "revoking an existing token as a non-admin must ack, not error: {existing:?}"
+        );
+        assert!(matches!(absent, ProtocolMessage::Ack { .. }), "revoking an absent token must ack identically: {absent:?}");
+
+        // The non-admin did not actually delete the token: a legitimate redeemer still gets in.
+        let carol = attach_session(&hub, "carol");
+        assert!(hub.join("carol", &carol, "ops", Some("tok")).await.is_ok(), "a non-admin revoke must not delete the token");
+    }
+
+    #[tokio::test]
+    async fn subscribe_re_checks_the_ban_atomically() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
+        let hub = Hub::new(store, HashMap::new());
+        let bob = attach_session(&hub, "bob");
+
+        // A ban landing after join's early check (the TOCTOU window) is still enforced by the
+        // re-check inside `subscribe`, under the same lock as the insert (#30).
+        hub.add_ban("ops", "bob");
+        assert!(!hub.subscribe(&bob, "ops"), "subscribe must refuse a banned user");
+        assert!(!hub.subscribers("ops").contains(&bob), "a banned user must not end up subscribed");
     }
 
     #[tokio::test]
