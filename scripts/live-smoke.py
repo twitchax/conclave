@@ -2,8 +2,9 @@
 """uat-005 live smoke (PRD-0009): two bridges on a deployed server exchange a channel message + whisper.
 
 Usage: CONCLAVE_SMOKE_SERVER=wss://your-app.example conclave-repo$ cargo make uat-deploy-smoke
-Requires: a registered identity in ~/.config/conclave for that server, `converse` perms on #ops and
-whispers, and a built release binary (cargo make build-release).
+Requires: a registered *server-admin* identity in ~/.config/conclave for that server (the smoke
+creates and deletes its own throwaway channel), whisper perms at `converse`, and a built release
+binary (cargo make build-release).
 """
 import json
 import subprocess
@@ -17,6 +18,8 @@ import pathlib
 
 BIN = str(pathlib.Path(__file__).resolve().parent.parent / "target" / "release" / "conclave")
 SERVER = os.environ.get("CONCLAVE_SMOKE_SERVER") or sys.exit("set CONCLAVE_SMOKE_SERVER=wss://<your-server>")
+# A throwaway channel so the smoke never depends on (or disturbs) real server state.
+CHANNEL = f"smoke-uat-{os.getpid()}"
 
 
 class Bridge:
@@ -85,18 +88,30 @@ def main():
             assert init, f"{br.session}: no initialize response"
             br.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-        # Both join #ops (deferred until the server's Joined ack — confirmed live).
+        # smoke-a (a server admin) creates the throwaway channel; the admin tools are gated on
+        # the async ServerInfo frame, so retry briefly while the role signal lands.
+        t = ""
+        for _ in range(10):
+            res = a.call_tool("create_channel", {"name": CHANNEL, "visibility": "public"})
+            t = text_of(res)
+            if res is not None and "admin" not in t.lower():
+                break
+            time.sleep(1)
+        print(f"[smoke-a] create_channel -> {t}")
+        ok &= CHANNEL in t
+
+        # Both join it at `converse` (deferred until the server's Joined ack — confirmed live).
         for br in (a, b):
-            res = br.call_tool("join_channel", {"channel": "ops"})
+            res = br.call_tool("join_channel", {"channel": CHANNEL, "perm": "converse"})
             t = text_of(res)
             print(f"[{br.session}] join_channel -> {t}")
-            ok &= res is not None and "joined ops" in t
+            ok &= res is not None and f"joined {CHANNEL}" in t
 
         # A sends; the send is server-acked (confirmed delivery, PRD-0008 T-001)...
-        res = a.call_tool("send_channel", {"channel": "ops", "text": "hello from smoke-a over Fly TLS"})
+        res = a.call_tool("send_channel", {"channel": CHANNEL, "text": "hello from smoke-a over Fly TLS"})
         t = text_of(res)
         print(f"[smoke-a] send_channel -> {t}")
-        ok &= res is not None and "sent to ops" in t
+        ok &= res is not None and f"sent to {CHANNEL}" in t
 
         # ...and B receives the injected notification.
         note = b.wait_for(lambda m: m.get("method") == "notifications/claude/channel")
@@ -110,7 +125,7 @@ def main():
             ok = False
 
         # Whisper B -> A by full path (derived from live presence, also server-acked).
-        res = a.call_tool("who", {"channel": "ops"})
+        res = a.call_tool("who", {"channel": CHANNEL})
         paths = [p.strip() for p in text_of(res).split(":", 1)[-1].split(",")]
         target = next(p for p in paths if p.endswith("/smoke-a"))
         res = b.call_tool("whisper", {"target": target, "text": "psst, whisper over the live server"})
@@ -125,13 +140,23 @@ def main():
             print(f"[smoke-a] NO whisper received: {note}")
             ok = False
 
-        # Presence: both live sessions visible in #ops.
-        res = a.call_tool("who", {"channel": "ops"})
+        # Presence: both live sessions visible in the channel.
+        res = a.call_tool("who", {"channel": CHANNEL})
         t = text_of(res)
-        print(f"[smoke-a] who(ops) -> {t}")
+        print(f"[smoke-a] who -> {t}")
         ok &= "smoke-a" in t and "smoke-b" in t
 
+        # Catch-up (PRD-0013): the just-sent message is readable back from retained history.
+        res = a.call_tool("catch_up", {"channel": CHANNEL, "since": "10m"})
+        t = text_of(res)
+        print(f"[smoke-a] catch_up -> {(t.splitlines() or ['<empty>'])[0]}")
+        ok &= res is not None and "hello from smoke-a over Fly TLS" in t
+
     finally:
+        try:
+            a.call_tool("delete_channel", {"name": CHANNEL}, timeout=10)
+        except Exception:
+            pass
         a.close()
         b.close()
 
