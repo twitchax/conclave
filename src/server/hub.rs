@@ -412,16 +412,21 @@ impl Hub {
                 let users = self.store.list_channel_members(&channel).await.map_err(internal)?;
                 Ok(ProtocolMessage::UserList { users })
             }
-            AdminOp::InviteCreate { channel, uses, expires_in_secs } => {
+            // First-class unban (previously only an acl-add side effect); grants no membership.
+            AdminOp::Unban { channel, user: target } => {
                 self.authorize_channel_admin(&channel, user).await?;
-                let token = identity::generate_token().map_err(internal)?;
-                let expires_at = match expires_in_secs {
-                    Some(secs) => Some(invite_expiry(secs)?),
-                    None => None,
-                };
-                self.store.create_invite(&channel, &token, uses.map(i64::from), expires_at, user).await.map_err(internal)?;
-                Ok(ProtocolMessage::InviteToken { token })
+                self.remove_ban(&channel, &target).await?;
+                Ok(ack(target))
             }
+            // Channel-admin ban audit — durable bans must never be write-only state.
+            AdminOp::BanList { channel } => {
+                self.authorize_channel_admin(&channel, user).await?;
+                let users = self.store.list_channel_bans(&channel).await.map_err(internal)?;
+                Ok(ProtocolMessage::UserList { users })
+            }
+            // Channel-admin invite audit — outstanding tokens with uses/expiry (PRD-0011).
+            AdminOp::InviteList { channel } => self.list_channel_invites(user, &channel).await,
+            AdminOp::InviteCreate { channel, uses, expires_in_secs } => self.create_invite(user, &channel, uses, expires_in_secs).await,
             AdminOp::InviteRevoke { token } => {
                 // Uniform ack whether or not the token exists, so a non-admin cannot use revoke as an
                 // existence oracle for tokens (#29): only the channel's admin actually deletes.
@@ -473,6 +478,36 @@ impl Hub {
                 Ok(ack(name))
             }
         }
+    }
+
+    /// Mints an invite token for a channel (channel-admin; bounded uses / expiry).
+    async fn create_invite(&self, user: &str, channel: &str, max_uses: Option<u32>, lifetime_secs: Option<u64>) -> Reply {
+        self.authorize_channel_admin(channel, user).await?;
+        let token = identity::generate_token().map_err(internal)?;
+        let expires_at = match lifetime_secs {
+            Some(secs) => Some(invite_expiry(secs)?),
+            None => None,
+        };
+        self.store.create_invite(channel, &token, max_uses.map(i64::from), expires_at, user).await.map_err(internal)?;
+        Ok(ProtocolMessage::InviteToken { token })
+    }
+
+    /// The channel-admin invite audit: outstanding tokens with uses/expiry (PRD-0011).
+    async fn list_channel_invites(&self, user: &str, channel: &str) -> Reply {
+        self.authorize_channel_admin(channel, user).await?;
+        let invites = self
+            .store
+            .list_invites(channel)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|i| crate::protocol::InviteInfo {
+                token: i.token,
+                uses_remaining: i.uses_remaining,
+                expires_at: i.expires_at,
+            })
+            .collect();
+        Ok(ProtocolMessage::InviteList { invites })
     }
 
     /// Erases a user entirely: their created channels (cascading memberships + invites + bans),
@@ -844,6 +879,81 @@ mod tests {
             hub.admin("mallory", AdminOp::AclList { channel: "ops".to_owned() }).await.is_err(),
             "a non-admin must not list a channel's members",
         );
+    }
+
+    #[tokio::test]
+    async fn invite_list_shows_outstanding_tokens_to_channel_admins_only() {
+        let hub = hub_with_private_channel(Some(2), None).await; // `ops` with invite `tok` by aaron.
+
+        // The channel admin sees the outstanding token with its remaining uses.
+        match hub.admin("aaron", AdminOp::InviteList { channel: "ops".to_owned() }).await.unwrap() {
+            ProtocolMessage::InviteList { invites } => {
+                assert_eq!(invites.len(), 1);
+                assert_eq!(invites[0].token, "tok");
+                assert_eq!(invites[0].uses_remaining, Some(2));
+            }
+            other => panic!("expected an InviteList, got {other:?}"),
+        }
+
+        // A non-admin is refused.
+        assert!(hub.admin("mallory", AdminOp::InviteList { channel: "ops".to_owned() }).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ban_visibility_list_and_unban_are_channel_admin_gated() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
+        let hub = Hub::new(store.clone(), HashMap::new()).await.unwrap();
+
+        hub.admin(
+            "aaron",
+            AdminOp::Ban {
+                channel: "ops".to_owned(),
+                user: "bob".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The channel admin lists the bans...
+        match hub.admin("aaron", AdminOp::BanList { channel: "ops".to_owned() }).await.unwrap() {
+            ProtocolMessage::UserList { users } => assert_eq!(users, vec!["bob".to_owned()]),
+            other => panic!("expected a UserList of bans, got {other:?}"),
+        }
+        // ...a non-admin is refused for both verbs...
+        assert!(hub.admin("mallory", AdminOp::BanList { channel: "ops".to_owned() }).await.is_err());
+        assert!(
+            hub.admin(
+                "mallory",
+                AdminOp::Unban {
+                    channel: "ops".to_owned(),
+                    user: "bob".to_owned(),
+                }
+            )
+            .await
+            .is_err()
+        );
+
+        // ...and unban lifts the ban durably WITHOUT granting ACL membership.
+        hub.admin(
+            "aaron",
+            AdminOp::Unban {
+                channel: "ops".to_owned(),
+                user: "bob".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        match hub.admin("aaron", AdminOp::BanList { channel: "ops".to_owned() }).await.unwrap() {
+            ProtocolMessage::UserList { users } => assert!(users.is_empty(), "unban must lift the ban: {users:?}"),
+            other => panic!("expected a UserList, got {other:?}"),
+        }
+        assert!(store.list_bans().await.unwrap().is_empty(), "unban must be durable");
+        assert!(!store.is_channel_member("ops", "bob").await.unwrap(), "unban must not grant ACL membership");
+
+        // The unbanned user can join the public channel again.
+        let bob = attach_session(&hub, "bob");
+        assert!(hub.join("bob", &bob, "ops", None).await.is_ok(), "an unbanned user may rejoin");
     }
 
     #[tokio::test]

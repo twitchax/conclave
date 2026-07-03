@@ -107,6 +107,18 @@ async fn execute(cli: &Cli) -> Void {
             )
             .await
         }
+        Command::Unban(args) => {
+            admin_op(
+                dir,
+                &args.server,
+                AdminOp::Unban {
+                    channel: args.channel.clone(),
+                    user: args.user.clone(),
+                },
+            )
+            .await
+        }
+        Command::Bans(args) => admin_op(dir, &args.server, AdminOp::BanList { channel: args.channel.clone() }).await,
         Command::User { command } => run_user(dir, command).await,
         Command::Skill(args) => run_skill(args),
     }
@@ -165,6 +177,13 @@ fn print_response(response: ProtocolMessage) -> Void {
         ProtocolMessage::UserList { users } => {
             for user in users {
                 println!("{user}");
+            }
+        }
+        ProtocolMessage::InviteList { invites } => {
+            for invite in invites {
+                let uses = invite.uses_remaining.map_or_else(|| "unlimited".to_owned(), |u| u.to_string());
+                let expires = invite.expires_at.unwrap_or_else(|| "never".to_owned());
+                println!("{}\tuses: {uses}\texpires: {expires}", invite.token);
             }
         }
         ProtocolMessage::Presence { channel, sessions } => {
@@ -362,6 +381,7 @@ async fn run_invite(explicit: Option<&PathBuf>, command: &InviteCommand) -> Void
             .await
         }
         InviteCommand::Revoke { server, token } => admin_op(explicit, server, AdminOp::InviteRevoke { token: token.clone() }).await,
+        InviteCommand::List { server, channel } => admin_op(explicit, server, AdminOp::InviteList { channel: channel.clone() }).await,
     }
 }
 
@@ -524,6 +544,10 @@ enum Command {
     Kick(KickArgs),
     /// Ban a user from a channel.
     Ban(BanArgs),
+    /// Lift a channel ban (does not grant ACL membership).
+    Unban(BanArgs),
+    /// List a channel's banned users.
+    Bans(BansArgs),
     /// Server-admin user management: list, remove.
     User {
         #[command(subcommand)]
@@ -551,6 +575,8 @@ impl Command {
             Command::Who(_) => "who",
             Command::Kick(_) => "kick",
             Command::Ban(_) => "ban",
+            Command::Unban(_) => "unban",
+            Command::Bans(_) => "bans",
             Command::User { .. } => "user",
             Command::Skill(_) => "skill",
         }
@@ -782,6 +808,15 @@ enum InviteCommand {
         /// The token to revoke.
         token: String,
     },
+    /// List a channel's outstanding invite tokens (channel-admin).
+    List {
+        /// Server the channel is on.
+        #[arg(long)]
+        server: String,
+        /// Channel to list invites for.
+        #[arg(long)]
+        channel: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -815,6 +850,17 @@ struct BanArgs {
     channel: String,
     /// Username to ban.
     user: String,
+}
+
+/// Arguments for `bans` (list a channel's banned users).
+#[derive(Args, Debug)]
+struct BansArgs {
+    /// Server the channel is on.
+    #[arg(long)]
+    server: String,
+    /// Channel to list bans for.
+    #[arg(long)]
+    channel: String,
 }
 
 #[derive(Subcommand, Debug)]

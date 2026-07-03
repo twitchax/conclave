@@ -67,6 +67,17 @@ pub struct MachineInfo {
     pub added_at: String,
 }
 
+/// An outstanding invite as surfaced by the channel-admin audit ([`ProtocolMessage::InviteList`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteInfo {
+    /// The opaque token string.
+    pub token: String,
+    /// Remaining redemptions, or unlimited if absent.
+    pub uses_remaining: Option<i64>,
+    /// RFC 3339 expiry, or non-expiring if absent.
+    pub expires_at: Option<String>,
+}
+
 /// An admin / moderation operation (DESIGN.md §7), authorized server-side by user role.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminOp {
@@ -159,6 +170,23 @@ pub enum AdminOp {
     },
     /// List a channel's ACL members (channel-admin; answered with a `UserList`).
     AclList {
+        /// Channel name.
+        channel: String,
+    },
+    /// Lift a channel ban (channel-admin; does not grant ACL membership).
+    Unban {
+        /// Channel name.
+        channel: String,
+        /// Username to unban.
+        user: String,
+    },
+    /// List a channel's banned users (channel-admin; answered with a `UserList`).
+    BanList {
+        /// Channel name.
+        channel: String,
+    },
+    /// List a channel's outstanding invites (channel-admin; answered with an `InviteList`).
+    InviteList {
         /// Channel name.
         channel: String,
     },
@@ -303,6 +331,14 @@ pub enum ProtocolMessage {
     UserList {
         /// The registered usernames.
         users: Vec<String>,
+    },
+    // ---------------------------------------------------------------------
+    // M10 additions — appended (forward-compat): operator-visibility listings.
+    // ---------------------------------------------------------------------
+    /// Server → client: a channel's outstanding invites (channel-admin audit, PRD-0011).
+    InviteList {
+        /// The outstanding invites.
+        invites: Vec<InviteInfo>,
     },
 }
 
@@ -478,6 +514,27 @@ mod tests {
     #[test]
     fn acl_list_admin_op_round_trips() {
         assert_round_trips(&ProtocolMessage::Admin(AdminOp::AclList { channel: "ops".to_owned() }));
+    }
+
+    #[test]
+    fn invite_list_round_trips_op_and_response() {
+        assert_round_trips(&ProtocolMessage::Admin(AdminOp::InviteList { channel: "ops".to_owned() }));
+        assert_round_trips(&ProtocolMessage::InviteList {
+            invites: vec![InviteInfo {
+                token: "tok".to_owned(),
+                uses_remaining: Some(3),
+                expires_at: None,
+            }],
+        });
+    }
+
+    #[test]
+    fn ban_visibility_admin_ops_round_trip() {
+        assert_round_trips(&ProtocolMessage::Admin(AdminOp::Unban {
+            channel: "ops".to_owned(),
+            user: "bob".to_owned(),
+        }));
+        assert_round_trips(&ProtocolMessage::Admin(AdminOp::BanList { channel: "ops".to_owned() }));
     }
 
     #[test]

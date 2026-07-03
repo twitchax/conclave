@@ -370,6 +370,21 @@ impl Store {
         Ok(rows.into_iter().next())
     }
 
+    /// The outstanding invites for one channel (the channel-admin audit view).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_invites(&self, channel: &str) -> Res<Vec<InviteRecord>> {
+        let mut response = self
+            .db
+            .query("SELECT * OMIT id FROM invite WHERE channel = $channel")
+            .bind(ByChannel { channel: channel.to_owned() })
+            .await
+            .context("failed to list invites")?;
+        response.take(0).context("failed to decode invite rows")
+    }
+
     /// Lists every channel; the caller applies visibility / membership gating (DESIGN.md §6).
     ///
     /// # Errors
@@ -542,6 +557,21 @@ impl Store {
         let mut response = self.db.query("SELECT channel, user FROM ban").await.context("failed to list bans")?;
         let rows: Vec<Membership> = response.take(0).context("failed to decode ban rows")?;
         Ok(rows.into_iter().map(|row| (row.channel, row.user)).collect())
+    }
+
+    /// The users banned from one channel (the channel-admin audit view).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_channel_bans(&self, channel: &str) -> Res<Vec<String>> {
+        let mut response = self
+            .db
+            .query("SELECT VALUE user FROM ban WHERE channel = $channel")
+            .bind(ByChannel { channel: channel.to_owned() })
+            .await
+            .context("failed to list channel bans")?;
+        response.take(0).context("failed to decode ban users")
     }
 
     /// The names of the channels created (and administered) by `user`.
