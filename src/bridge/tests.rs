@@ -645,3 +645,92 @@ async fn bridge_link_flapping_diagnoses_a_handle_conflict_and_quiets_down() {
     let texts = drain_notice_texts(&mut harness.to_mcp_rx);
     assert!(texts.iter().any(|t| t.contains("Disconnected")), "a stable link resets the breaker: {texts:?}");
 }
+
+// -----------------------------------------------------------------------------
+// PRD-0013 T-003 — the catch_up tool (agent-driven read-since).
+// -----------------------------------------------------------------------------
+
+#[test]
+fn bridge_catch_up_requests_history_and_renders_the_page() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    // An explicit duration computes the watermark from the wall clock.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(7),
+        name: "catch_up".to_owned(),
+        args: json!({ "channel": "ops", "since": "2h" }),
+    });
+    let expected = chrono::Utc::now().timestamp_millis() - 2 * 3600 * 1000;
+    match harness.to_server_rx.try_recv().unwrap() {
+        ProtocolMessage::ReadSince { channel, since_ms } => {
+            assert_eq!(channel, "ops");
+            assert!((since_ms - expected).abs() < 5_000, "since must be ~now-2h, got {since_ms} vs {expected}");
+        }
+        other => panic!("expected a ReadSince frame, got {other:?}"),
+    }
+
+    // The History response resolves the deferred call with a rendered, clearly-untrusted page.
+    harness.core.handle_link_event(
+        "s1",
+        client::LinkEvent::Frame(ProtocolMessage::History {
+            channel: "ops".to_owned(),
+            messages: vec![
+                crate::protocol::HistoryMessage {
+                    from: SessionPath::new("david", "desktop", "main"),
+                    ts_ms: 1_751_500_000_000,
+                    payload: Payload::Plain("one".to_owned()),
+                },
+                crate::protocol::HistoryMessage {
+                    from: SessionPath::new("david", "desktop", "main"),
+                    ts_ms: 1_751_500_060_000,
+                    payload: Payload::Plain("two".to_owned()),
+                },
+            ],
+        }),
+    );
+    let reply = loop {
+        let msg = harness.to_mcp_rx.try_recv().expect("expected the catch_up tool result");
+        if msg.get("id") == Some(&json!(7)) {
+            break msg;
+        }
+    };
+    let text = reply.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
+    assert!(text.contains("one") && text.contains("two"), "the page must render every message: {text}");
+    assert!(text.contains("david/desktop/main"), "the page must attribute senders: {text}");
+    assert!(text.contains("untrusted"), "the page must be framed as untrusted quoted content: {text}");
+}
+
+#[test]
+fn bridge_catch_up_defaults_to_the_live_watermark() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    // A live message sets the channel watermark…
+    let before = chrono::Utc::now().timestamp_millis();
+    harness.core.handle_link_event("s1", client::LinkEvent::Frame(channel_msg("ops", "seen live")));
+
+    // …so a no-args catch_up asks from (watermark - slack), not from zero.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(8),
+        name: "catch_up".to_owned(),
+        args: json!({ "channel": "ops" }),
+    });
+    match harness.to_server_rx.try_recv().unwrap() {
+        ProtocolMessage::ReadSince { since_ms, .. } => {
+            assert!(since_ms > 0, "a seen channel must not re-read everything");
+            assert!(since_ms <= chrono::Utc::now().timestamp_millis(), "the watermark cannot be in the future");
+            assert!(since_ms >= before - 61_000, "the slack window must stay bounded: {since_ms}");
+        }
+        other => panic!("expected a ReadSince frame, got {other:?}"),
+    }
+
+    // A never-seen channel reads everything retained.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(9),
+        name: "catch_up".to_owned(),
+        args: json!({ "channel": "fresh" }),
+    });
+    match harness.to_server_rx.try_recv().unwrap() {
+        ProtocolMessage::ReadSince { since_ms, .. } => assert_eq!(since_ms, 0, "no watermark -> read the full retained window"),
+        other => panic!("expected a ReadSince frame, got {other:?}"),
+    }
+}

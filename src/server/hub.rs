@@ -24,11 +24,15 @@ use tokio::{
 use crate::{
     base::{SessionPath, Visibility},
     identity::{self, AuthError},
-    protocol::{AdminOp, ChannelInfo, MachineInfo, Payload, ProtocolError, ProtocolMessage},
+    protocol::{self, AdminOp, ChannelInfo, HistoryMessage, MachineInfo, Payload, ProtocolError, ProtocolMessage},
     store::{ChannelRecord, Store},
 };
 
 use super::AclError;
+
+/// Upper bound on one [`ProtocolMessage::History`] page (PRD-0013): the client re-asks with the
+/// last row's `ts_ms` to page through a larger backlog.
+const HISTORY_PAGE_CAP: usize = 500;
 
 /// The outbound half of a live session: the router pushes frames here and the session's writer
 /// task drains them to the transport.
@@ -360,7 +364,9 @@ impl Hub {
     // -----------------------------------------------------------------------
 
     /// Fans a channel message out to every *other* subscribed session; the sender must be a member.
-    pub(crate) fn post(&self, from: &SessionPath, channel: &str, payload: Payload) -> Result<(), ProtocolError> {
+    /// The message is retained for catch-up before delivery (PRD-0013): a failed history write
+    /// logs and still delivers — availability over completeness.
+    pub(crate) async fn post(&self, from: &SessionPath, channel: &str, payload: Payload) -> Result<(), ProtocolError> {
         let targets: Vec<(Arc<Kill>, Outbound)> = {
             let st = self.state();
             let subs = st.subscriptions.get(channel).ok_or_else(|| ProtocolError::from(AclError::NotMember(channel.to_owned())))?;
@@ -372,6 +378,17 @@ impl Hub {
                 .filter_map(|p| st.sessions.get(p).map(|e| (Arc::clone(&e.kill), e.outbound.clone())))
                 .collect()
         };
+
+        // Retain the envelope verbatim, server-stamped (the read-since watermark unit).
+        match protocol::encode_payload(&payload) {
+            Ok(bytes) => {
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                if let Err(err) = self.store.append_message(channel, &from.to_string(), &bytes, ts_ms).await {
+                    tracing::warn!(%channel, error = %err, "failed to retain channel history; delivering live only");
+                }
+            }
+            Err(err) => tracing::warn!(%channel, error = %err, "failed to encode payload for retention; delivering live only"),
+        }
 
         let msg = ProtocolMessage::ChannelMsg {
             channel: channel.to_owned(),
@@ -386,6 +403,31 @@ impl Hub {
             }
         }
         Ok(())
+    }
+
+    /// Reads a channel's retained history strictly after `since_ms` (PRD-0013 T-002). The caller
+    /// must be subscribed — the same check (and the same error) as posting, so a refusal never
+    /// reveals whether a private channel exists.
+    pub(crate) async fn read_since(&self, caller: &SessionPath, channel: &str, since_ms: i64) -> Result<ProtocolMessage, ProtocolError> {
+        {
+            let st = self.state();
+            let subs = st.subscriptions.get(channel).ok_or_else(|| ProtocolError::from(AclError::NotMember(channel.to_owned())))?;
+            if !subs.contains(caller) {
+                return Err(AclError::NotMember(channel.to_owned()).into());
+            }
+        }
+
+        let rows = self.store.read_messages_since(channel, since_ms, HISTORY_PAGE_CAP).await.map_err(internal)?;
+        let messages = rows
+            .into_iter()
+            .filter_map(|row| {
+                // Undecodable rows (wire evolution beyond this build) are skipped, not fatal.
+                let payload = protocol::decode_payload(&row.payload).ok()?;
+                let from = row.from.parse::<SessionPath>().ok()?;
+                Some(HistoryMessage { from, ts_ms: row.ts_ms, payload })
+            })
+            .collect();
+        Ok(ProtocolMessage::History { channel: channel.to_owned(), messages })
     }
 
     /// Delivers a whisper to exactly one live session path, erroring if it is not online (§8).
@@ -847,8 +889,8 @@ mod tests {
         hub.join("bob", &bob, "ops", None).await.unwrap();
 
         // Fill bob's 1-slot queue, then overflow it — the second post cannot enqueue.
-        hub.post(&aaron, "ops", Payload::Plain("one".to_owned())).unwrap();
-        hub.post(&aaron, "ops", Payload::Plain("two".to_owned())).unwrap();
+        hub.post(&aaron, "ops", Payload::Plain("one".to_owned())).await.unwrap();
+        hub.post(&aaron, "ops", Payload::Plain("two".to_owned())).await.unwrap();
 
         // The slow consumer is force-dropped (its kill fires) rather than buffering without bound.
         assert!(

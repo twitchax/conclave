@@ -272,6 +272,93 @@ async fn cli_send_and_tail_relay_a_message_through_a_live_channel() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_tail_since_replays_the_backlog_then_streams() {
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let _server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+
+    let home = TempDir::new().unwrap();
+    let dir = home.path();
+    assert!(run_cli(dir, &["register", "--server", &url, "--username", "aaron", "--machine", "workstation"]).status.success());
+    assert!(run_cli(dir, &["channel", "create", "--server", &url, "watch", "--visibility", "public"]).status.success());
+
+    // Post BEFORE any tail exists — the catch-up gap (PRD-0013), seen from the CLI.
+    assert!(run_cli(dir, &["send", "--server", &url, "--channel", "watch", "posted before the tail existed"]).status.success());
+
+    // `tail --since 1h` replays the retained backlog first…
+    let mut tail = tokio::process::Command::new(CONCLAVE_BIN)
+        .args(["tail", "--config-dir", dir.to_str().unwrap(), "--server", &url, "--channel", "watch", "--since", "1h"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `conclave tail`");
+    let mut tail_lines = BufReader::new(tail.stdout.take().unwrap()).lines();
+    let ready = timeout(Duration::from_secs(15), tail_lines.next_line()).await.unwrap().unwrap().unwrap();
+    assert!(ready.contains("watch"), "tail must announce the joined channel: {ready}");
+    let backlog = timeout(Duration::from_secs(15), tail_lines.next_line()).await.unwrap().unwrap().unwrap();
+    assert!(backlog.contains("posted before the tail existed"), "tail --since must replay the backlog: {backlog}");
+
+    // …then keeps streaming live.
+    assert!(run_cli(dir, &["send", "--server", &url, "--channel", "watch", "and now live"]).status.success());
+    let live = timeout(Duration::from_secs(15), tail_lines.next_line()).await.unwrap().unwrap().unwrap();
+    assert!(live.contains("and now live"), "tail must keep streaming after the replay: {live}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_tail_reconnects_across_a_server_restart() {
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+
+    let home = TempDir::new().unwrap();
+    let dir = home.path();
+    assert!(run_cli(dir, &["register", "--server", &url, "--username", "aaron", "--machine", "workstation"]).status.success());
+    assert!(run_cli(dir, &["channel", "create", "--server", &url, "watch", "--visibility", "public"]).status.success());
+
+    let mut tail = tokio::process::Command::new(CONCLAVE_BIN)
+        .args(["tail", "--config-dir", dir.to_str().unwrap(), "--server", &url, "--channel", "watch", "--since", "1h"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `conclave tail`");
+    let mut tail_lines = BufReader::new(tail.stdout.take().unwrap()).lines();
+    let ready = timeout(Duration::from_secs(15), tail_lines.next_line()).await.unwrap().unwrap().unwrap();
+    assert!(ready.contains("watch"), "tail must announce the joined channel: {ready}");
+
+    assert!(run_cli(dir, &["send", "--server", &url, "--channel", "watch", "before-restart"]).status.success());
+    let line = timeout(Duration::from_secs(15), tail_lines.next_line()).await.unwrap().unwrap().unwrap();
+    assert!(line.contains("before-restart"), "tail must stream pre-restart traffic: {line}");
+
+    // Restart the server on the same address and store — the deploy scenario that used to kill
+    // tail with a raw rustls error (PRD-0013 T-004). The tail must reconnect and resume.
+    drop(server);
+    let _server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+    assert!(run_cli(dir, &["send", "--server", &url, "--channel", "watch", "after-restart"]).status.success());
+
+    // Reconnect replays from the watermark, so duplicates of earlier lines are tolerated — the
+    // requirement is that post-restart traffic arrives without human intervention.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let line = timeout(remaining, tail_lines.next_line())
+            .await
+            .expect("timed out waiting for the post-restart message")
+            .unwrap()
+            .expect("tail exited instead of reconnecting");
+        if line.contains("after-restart") {
+            break;
+        }
+    }
+}
+
 /// `conclave status` is the one-command identity/connectivity view: registrations, per-server
 /// reachability, and the resolved permission table; an unreachable server exits non-zero.
 #[tokio::test]

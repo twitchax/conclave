@@ -226,8 +226,11 @@ framing **and** the permission-relay (§12) — conclave does not control them d
   "online." Presence reflects reality.
 - Central holds the connections, so **"who's online" is a central query** — you never poll a
   peer's bridge.
-- **Delivery is at-most-once, best-effort:** no acks, no dedup, lossy across reconnect windows.
-  **No store-and-forward** — offline means you miss the message.
+- **Live delivery is at-most-once, best-effort:** no dedup, lossy across reconnect windows (sends
+  are server-acked to the *sender*, PRD-0008). **No store-and-forward push** — but channel traffic
+  is **retained for 7 days** (PRD-0013): a client that was offline reads the gap back explicitly
+  with `ReadSince` (the bridge's `catch_up` tool / `tail --since`). The reader owns the watermark;
+  the server never tracks per-session cursors. Whispers are ephemeral — never retained.
 
 ## 11. Transport
 
@@ -313,7 +316,7 @@ framing **and** the permission-relay (§12) — conclave does not control them d
 - **Permissions** (carried from the prototype): the bridge relays `claude/channel/permission_request`
   outbound and applies the returned verdict — the remote human approval gate referenced in §12.
 
-## 15. Persistence (central — durable config only)
+## 15. Persistence (central — durable config + bounded history)
 
 SurrealDB, **embedded** (the official `surrealdb` Rust SDK with an embedded KV backend), so
 `conclave serve` stays a single self-contained binary with a data directory — no external DB
@@ -325,9 +328,13 @@ ORM (the Rust ones are immature; the SDK is already the idiomatic typed layer).
 - `machine   { user, name, pubkey UNIQUE, added_at }`  — `name` unique within a user
 - `channel   { name UNIQUE, visibility, acl: [username], created_by, created_at }`
 - `invite    { channel, token, uses_remaining?, expires_at?, created_by }`
+- `message   { channel, from, payload (opaque envelope bytes), ts_ms }` — **7-day retention**
+  (hourly purge sweep, PRD-0013); cascades on channel delete/rename; read via `ReadSince`
+  (subscription-gated, visibility-uniform refusal). The payload is stored verbatim, so E2E
+  ciphertext (§19) is retained without being readable by the server.
 
 **Not in the DB:** live presence + channel subscriptions (in-memory, tied to WS connections);
-message history (none); **permission levels** (local bridge config, §9); **server admins** (the
+whisper history (ephemeral by decision); **permission levels** (local bridge config, §9); **server admins** (the
 `serve` config `users` allowlist, §7).
 
 ## 16. Error handling

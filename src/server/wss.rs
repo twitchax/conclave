@@ -32,6 +32,10 @@ use super::{hub::Hub, session::run_session};
 const REAP_INTERVAL: Duration = Duration::from_secs(15);
 /// How long a session may go without any inbound frame before it is reaped (DESIGN.md §10).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Retained-history window: messages older than this are purged (PRD-0013, constant in v1).
+const HISTORY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How often the retention sweep runs.
+const HISTORY_PURGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// The operator-supplied `serve` configuration (DESIGN.md §7, §13).
 pub struct ServerConfig {
@@ -60,6 +64,7 @@ pub async fn serve(config: ServerConfig) -> Void {
             tracing::warn!(admin = %name, "admin username is unpinned and can be squatted by the first client to register it; pin it as `--admin <user>=<pubkey>`");
         }
     }
+    spawn_history_purge(store.clone());
     let hub = Hub::new(store, config.admins).await?;
 
     spawn_reaper(Arc::clone(&hub));
@@ -82,6 +87,20 @@ fn spawn_reaper(hub: Arc<Hub>) {
             let reaped = hub.reap_idle(IDLE_TIMEOUT);
             if reaped > 0 {
                 tracing::debug!(reaped, "reaped idle sessions");
+            }
+        }
+    });
+}
+
+/// Spawns the background history-retention sweep (PRD-0013): hourly, drop rows past the window.
+fn spawn_history_purge(store: Store) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HISTORY_PURGE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let cutoff = chrono::Utc::now().timestamp_millis().saturating_sub(i64::try_from(HISTORY_RETENTION.as_millis()).unwrap_or(i64::MAX));
+            if let Err(err) = store.purge_messages_before(cutoff).await {
+                tracing::warn!(error = %err, "history retention sweep failed");
             }
         }
     });

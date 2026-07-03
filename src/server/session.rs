@@ -273,9 +273,18 @@ async fn handle_frame(hub: &Arc<Hub>, ctx: &SessionCtx, outbound: &Outbound, fra
         // The client-supplied `from` is ignored; the server stamps the authenticated path (§12).
         // Success is acked so the sender's deferred tool call resolves and its errors correlate
         // (PRD-0008 T-001); the ack is not fanned out to other subscribers.
-        ProtocolMessage::ChannelMsg { channel, payload, .. } => match hub.post(&ctx.path, &channel, payload) {
+        ProtocolMessage::ChannelMsg { channel, payload, .. } => match hub.post(&ctx.path, &channel, payload).await {
             Ok(()) => {
                 let _ = outbound.try_send(ProtocolMessage::Ack { detail: None });
+            }
+            Err(e) => {
+                let _ = outbound.try_send(err(e));
+            }
+        },
+        // Retained-history catch-up (PRD-0013): subscribed callers page the channel's backlog.
+        ProtocolMessage::ReadSince { channel, since_ms } => match hub.read_since(&ctx.path, &channel, since_ms).await {
+            Ok(history) => {
+                let _ = outbound.try_send(history);
             }
             Err(e) => {
                 let _ = outbound.try_send(err(e));

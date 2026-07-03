@@ -36,7 +36,23 @@ DEFINE INDEX IF NOT EXISTS invite_token ON invite FIELDS token UNIQUE;
 DEFINE INDEX IF NOT EXISTS membership_channel_user ON membership FIELDS channel, user UNIQUE;
 DEFINE INDEX IF NOT EXISTS ban_channel_user ON ban FIELDS channel, user UNIQUE;
 DEFINE TABLE IF NOT EXISTS meta;
+DEFINE TABLE IF NOT EXISTS message;
+DEFINE INDEX IF NOT EXISTS message_channel_ts ON message FIELDS channel, ts_ms;
 ";
+
+/// One retained channel message (PRD-0013 T-001). The payload is the wire envelope stored
+/// verbatim as opaque bytes, so E2E ciphertext (PRD-0010) is retained without being readable.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct MessageRecord {
+    /// The channel the message was posted to.
+    pub channel: String,
+    /// The sender's full `user/machine/session` path.
+    pub from: String,
+    /// The bincode-encoded [`Payload`](crate::protocol::Payload) envelope, verbatim.
+    pub payload: Vec<u8>,
+    /// Server-stamped receive time, epoch milliseconds (the read-since watermark unit).
+    pub ts_ms: i64,
+}
 
 /// Server-lifetime metadata, held as the single fixed record `meta:server` (PRD-0012 T-003).
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -145,6 +161,18 @@ struct Rename {
 }
 
 #[derive(SurrealValue)]
+struct ReadSinceBind {
+    channel: String,
+    since_ms: i64,
+    cap: i64,
+}
+
+#[derive(SurrealValue)]
+struct PurgeBind {
+    cutoff_ms: i64,
+}
+
+#[derive(SurrealValue)]
 struct SetUses {
     // `token` is a protected variable name in SurrealQL, so bind under `tok`.
     tok: String,
@@ -239,6 +267,61 @@ impl Store {
         let mut response = self.db.query("SELECT * OMIT id FROM meta").await.context("failed to re-query server meta")?;
         let rows: Vec<MetaRecord> = response.take(0).context("failed to decode server meta")?;
         rows.into_iter().next().map(|meta| meta.instance_id).context("server meta write raced but no record exists")
+    }
+
+    /// Appends one channel message to the retained history (PRD-0013 T-001).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn append_message(&self, channel: &str, from: &str, payload: &[u8], ts_ms: i64) -> Void {
+        self.insert(
+            "message",
+            MessageRecord {
+                channel: channel.to_owned(),
+                from: from.to_owned(),
+                payload: payload.to_vec(),
+                ts_ms,
+            },
+        )
+        .await
+    }
+
+    /// Reads a channel's retained messages strictly after `since_ms`, oldest-first, capped at
+    /// `cap` rows (the caller re-asks with the last row's `ts_ms` to page).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn read_messages_since(&self, channel: &str, since_ms: i64, cap: usize) -> Res<Vec<MessageRecord>> {
+        let mut response = self
+            .db
+            .query("SELECT * OMIT id FROM message WHERE channel = $channel AND ts_ms > $since_ms ORDER BY ts_ms ASC LIMIT $cap")
+            .bind(ReadSinceBind {
+                channel: channel.to_owned(),
+                since_ms,
+                cap: i64::try_from(cap).unwrap_or(i64::MAX),
+            })
+            .await
+            .context("failed to query message history")?;
+        let rows: Vec<MessageRecord> = response.take(0).context("failed to decode message history")?;
+        Ok(rows)
+    }
+
+    /// Deletes every retained message older than `cutoff_ms` (the retention sweep, PRD-0013).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn purge_messages_before(&self, cutoff_ms: i64) -> Void {
+        self.db
+            .query("DELETE FROM message WHERE ts_ms < $cutoff_ms")
+            .bind(PurgeBind { cutoff_ms })
+            .await
+            .context("failed to purge message history")?
+            .check()
+            .context("message purge reported an error")?;
+        Ok(())
     }
 
     /// Creates a user, enforcing the unique-username constraint.
@@ -694,6 +777,13 @@ impl Store {
             .context("failed to migrate channel bans")?
             .check()
             .context("ban rename reported an error")?;
+        self.db
+            .query("UPDATE message SET channel = $new WHERE channel = $old")
+            .bind(Rename { old: old.to_owned(), new: new.to_owned() })
+            .await
+            .context("failed to migrate channel history")?
+            .check()
+            .context("message rename reported an error")?;
         Ok(())
     }
 
@@ -733,6 +823,15 @@ impl Store {
             .context("failed to delete channel bans")?
             .check()
             .context("ban delete reported an error")?;
+        // History dies with the channel — a future same-named channel must not inherit it, and a
+        // deleted channel's contents must not be readable ever again (PRD-0013).
+        self.db
+            .query("DELETE message WHERE channel = $channel")
+            .bind(ByChannel { channel: name.to_owned() })
+            .await
+            .context("failed to delete channel history")?
+            .check()
+            .context("message delete reported an error")?;
         Ok(())
     }
 
@@ -879,6 +978,57 @@ mod tests {
             panic!("the store never became reopenable after drop");
         };
         assert_eq!(reopened.instance_id().await.unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn store_messages_append_and_read_since_in_order() {
+        let store = store().await;
+        store.append_message("ops", "aaron/ws/s1", b"one", 100).await.unwrap();
+        store.append_message("ops", "aaron/ws/s1", b"two", 200).await.unwrap();
+        store.append_message("other", "aaron/ws/s1", b"elsewhere", 150).await.unwrap();
+
+        // Channel-scoped, oldest-first, strictly-after the watermark.
+        let msgs = store.read_messages_since("ops", 50, 10).await.unwrap();
+        assert_eq!(msgs.iter().map(|m| m.payload.as_slice()).collect::<Vec<_>>(), vec![b"one".as_slice(), b"two".as_slice()]);
+        assert_eq!((msgs[0].ts_ms, msgs[0].from.as_str()), (100, "aaron/ws/s1"));
+
+        let after = store.read_messages_since("ops", 100, 10).await.unwrap();
+        assert_eq!(after.len(), 1, "since is exclusive: the watermark message itself is not re-delivered");
+        assert_eq!(after[0].payload, b"two");
+
+        // The page cap bounds a read, oldest-first (the client re-asks with the last ts).
+        let capped = store.read_messages_since("ops", 0, 1).await.unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].payload, b"one");
+    }
+
+    #[tokio::test]
+    async fn store_messages_purge_before_removes_old_rows() {
+        let store = store().await;
+        store.append_message("ops", "aaron/ws/s1", b"old", 100).await.unwrap();
+        store.append_message("ops", "aaron/ws/s1", b"new", 200).await.unwrap();
+
+        store.purge_messages_before(150).await.unwrap();
+
+        let msgs = store.read_messages_since("ops", 0, 10).await.unwrap();
+        assert_eq!(msgs.len(), 1, "rows older than the retention cutoff must be gone");
+        assert_eq!(msgs[0].payload, b"new");
+    }
+
+    #[tokio::test]
+    async fn store_messages_cascade_on_channel_delete_and_rename() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
+        store.append_message("ops", "aaron/ws/s1", b"hello", 100).await.unwrap();
+
+        // History follows a rename…
+        store.rename_channel("ops", "ops2").await.unwrap();
+        assert_eq!(store.read_messages_since("ops2", 0, 10).await.unwrap().len(), 1);
+        assert!(store.read_messages_since("ops", 0, 10).await.unwrap().is_empty());
+
+        // …and dies with the channel.
+        store.delete_channel("ops2").await.unwrap();
+        assert!(store.read_messages_since("ops2", 0, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

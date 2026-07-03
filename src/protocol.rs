@@ -340,6 +340,36 @@ pub enum ProtocolMessage {
         /// The outstanding invites.
         invites: Vec<InviteInfo>,
     },
+    // ---------------------------------------------------------------------
+    // M12 additions — appended (forward-compat): retained history (PRD-0013).
+    // ---------------------------------------------------------------------
+    /// Client → server: read the channel's retained history strictly after `since_ms`. The caller
+    /// must be subscribed; refusal is visibility-uniform with posting (PRD-0013 T-002).
+    ReadSince {
+        /// The channel to read.
+        channel: String,
+        /// The exclusive watermark, server-stamped epoch milliseconds (`0` = everything retained).
+        since_ms: i64,
+    },
+    /// Server → client: one page of retained history (oldest-first, capped; re-ask with the last
+    /// row's `ts_ms` to page).
+    History {
+        /// The channel the page belongs to.
+        channel: String,
+        /// The messages, oldest-first.
+        messages: Vec<HistoryMessage>,
+    },
+}
+
+/// One retained channel message as surfaced by [`ProtocolMessage::History`] (PRD-0013).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryMessage {
+    /// The sender's full session path (server-stamped at post time).
+    pub from: SessionPath,
+    /// Server-stamped receive time, epoch milliseconds — the read-since watermark unit.
+    pub ts_ms: i64,
+    /// The message envelope, verbatim as it crossed the wire.
+    pub payload: Payload,
 }
 
 /// Errors that cross the wire as a [`ProtocolMessage::Error`] frame and are matched on by the
@@ -404,6 +434,26 @@ pub fn encode(message: &ProtocolMessage) -> Res<Vec<u8>> {
 pub fn decode(bytes: &[u8]) -> Res<ProtocolMessage> {
     let (message, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard()).context("failed to decode protocol frame")?;
     Ok(message)
+}
+
+/// Encodes a bare [`Payload`] envelope for at-rest retention (PRD-0013) — the same codec as the
+/// wire, so stored history is byte-identical to what crossed it (E2E ciphertext included).
+///
+/// # Errors
+///
+/// Returns an error if encoding fails.
+pub fn encode_payload(payload: &Payload) -> Res<Vec<u8>> {
+    bincode::serde::encode_to_vec(payload, bincode::config::standard()).context("failed to encode payload envelope")
+}
+
+/// Decodes a retained [`Payload`] envelope (the inverse of [`encode_payload`]).
+///
+/// # Errors
+///
+/// Returns an error if the bytes are not a valid encoded envelope.
+pub fn decode_payload(bytes: &[u8]) -> Res<Payload> {
+    let (payload, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard()).context("failed to decode payload envelope")?;
+    Ok(payload)
 }
 
 /// Length-delimited sending of protocol frames over any async writer.
@@ -526,6 +576,29 @@ mod tests {
                 expires_at: None,
             }],
         });
+    }
+
+    #[test]
+    fn history_frames_round_trip() {
+        assert_round_trips(&ProtocolMessage::ReadSince {
+            channel: "ops".to_owned(),
+            since_ms: 1_751_500_000_000,
+        });
+        assert_round_trips(&ProtocolMessage::History {
+            channel: "ops".to_owned(),
+            messages: vec![HistoryMessage {
+                from: SessionPath::new("aaron", "workstation", "razel"),
+                ts_ms: 1_751_500_000_123,
+                payload: Payload::Plain("hello".to_owned()),
+            }],
+        });
+    }
+
+    #[test]
+    fn payload_envelope_round_trips_for_retention() {
+        let payload = Payload::Plain("retained".to_owned());
+        let bytes = encode_payload(&payload).unwrap();
+        assert_eq!(decode_payload(&bytes).unwrap(), payload);
     }
 
     #[test]

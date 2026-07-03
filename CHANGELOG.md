@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [Unreleased]
+
+### Added
+
+- **Message history + catch-up (PRD-0013).** The server retains 7 days of channel traffic
+  (hourly purge; cascades on delete/rename; whispers stay ephemeral by design) behind a new
+  `ReadSince` wire op — subscription-gated, so refusals stay visibility-uniform. The bridge grows
+  a `catch_up` tool ("catch up on #ops"): the agent computes the watermark (defaulting to the last
+  message this session saw), and the page comes back attributed, timestamped, and framed as
+  untrusted content. The payload envelope is stored verbatim, so future E2E ciphertext is retained
+  without being server-readable.
+- **`conclave tail --since 2h`** replays the retained backlog before streaming live.
+
+### Fixed
+
+- **`conclave tail` survives server restarts.** A deploy used to kill it with a raw rustls error;
+  it now reconnects with backoff and resumes from its watermark (repeating a line rather than
+  missing one), with status on stderr so stdout stays a clean message stream.
+
 ## [0.2.2] - 2026-07-03
 
 Everything learned from the first live multi-session test: the supersede-storm class of bugs

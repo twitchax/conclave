@@ -216,6 +216,26 @@ impl FromStr for SessionPath {
     }
 }
 
+/// Parses a human duration (`30s`, `10m`, `24h`, `7d`, or bare seconds) into seconds — shared by
+/// the CLI (`invite create --expires-in`, `tail --since`) and the bridge's `catch_up` tool.
+///
+/// # Errors
+///
+/// Returns an error if the numeric part does not parse.
+pub fn parse_duration_secs(value: &str) -> Res<u64> {
+    use anyhow::Context as _;
+    let value = value.trim();
+    let (digits, mult) = match value.chars().last() {
+        Some('s') => (&value[..value.len() - 1], 1),
+        Some('m') => (&value[..value.len() - 1], 60),
+        Some('h') => (&value[..value.len() - 1], 3600),
+        Some('d') => (&value[..value.len() - 1], 86_400),
+        _ => (value, 1),
+    };
+    let count: u64 = digits.trim().parse().with_context(|| format!("invalid duration `{value}`"))?;
+    Ok(count * mult)
+}
+
 #[cfg(test)]
 mod tests {
     // Tests relax `unwrap_used` (house convention; DESIGN.md §22).

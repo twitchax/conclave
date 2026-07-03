@@ -111,7 +111,10 @@ async fn execute(cli: &Cli) -> Void {
             println!("✓ sent to {}", args.channel);
             Ok(())
         }
-        Command::Tail(args) => control::tail(&args.server, &load_identity(dir)?, &args.session.clone().unwrap_or_else(cli_session), &args.channel).await,
+        Command::Tail(args) => {
+            let since_secs = args.since.as_deref().map(conclavelib::base::parse_duration_secs).transpose()?;
+            control::tail(&args.server, &load_identity(dir)?, &args.session.clone().unwrap_or_else(cli_session), &args.channel, since_secs).await
+        }
         Command::Who(args) => print_response(control::one_shot(&args.server, &load_identity(dir)?, &cli_session(), ProtocolMessage::Who { channel: args.channel.clone() }).await?),
         Command::Kick(args) => {
             admin_op(
@@ -472,7 +475,7 @@ async fn run_acl(explicit: Option<&PathBuf>, command: &AclCommand) -> Void {
 async fn run_invite(explicit: Option<&PathBuf>, command: &InviteCommand) -> Void {
     match command {
         InviteCommand::Create { server, channel, uses, expires_in } => {
-            let expires_in_secs = expires_in.as_deref().map(parse_duration_secs).transpose()?;
+            let expires_in_secs = expires_in.as_deref().map(conclavelib::base::parse_duration_secs).transpose()?;
             admin_op(
                 explicit,
                 server,
@@ -549,20 +552,6 @@ fn parse_visibility(value: Option<&str>) -> Res<Visibility> {
         Some(value) => value.parse().map_err(anyhow::Error::from),
         None => Ok(Visibility::Public),
     }
-}
-
-/// Parses a human duration (`30s`, `10m`, `24h`, `7d`, or bare seconds) into seconds.
-fn parse_duration_secs(value: &str) -> Res<u64> {
-    let value = value.trim();
-    let (digits, mult) = match value.chars().last() {
-        Some('s') => (&value[..value.len() - 1], 1),
-        Some('m') => (&value[..value.len() - 1], 60),
-        Some('h') => (&value[..value.len() - 1], 3600),
-        Some('d') => (&value[..value.len() - 1], 86_400),
-        _ => (value, 1),
-    };
-    let count: u64 = digits.trim().parse().with_context(|| format!("invalid duration `{value}`"))?;
-    Ok(count * mult)
 }
 
 /// Renders every subcommand's `--help` into the skill's command reference (always CLI-accurate).
@@ -1014,6 +1003,9 @@ struct TailArgs {
     /// Session handle for the tail connection (defaults to a per-process handle).
     #[arg(long = "as")]
     session: Option<String>,
+    /// Replay the retained backlog this far back first (e.g. `2h`, `45m`, `1d`; up to 7 days).
+    #[arg(long)]
+    since: Option<String>,
 }
 
 /// Arguments for `bans` (list a channel's banned users).

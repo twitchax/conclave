@@ -108,14 +108,57 @@ pub async fn send_message(url: &str, identity: &Identity, session: &str, channel
     }
 }
 
+/// Base and cap for tail's reconnect backoff (PRD-0013 T-004): a server restart (deploy) should
+/// not kill the watch — reconnect quietly and resume from the watermark.
+const TAIL_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const TAIL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Slack subtracted from the resume watermark, preferring a repeated line to a missed one.
+const TAIL_RESUME_SLACK_MS: i64 = 5_000;
+
+/// A tail failure that must not be retried (a rejection, not a transport loss).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TailFatal(String);
+
 /// Joins `channel` and streams its traffic to stdout until Ctrl-C — the minimal human "watch the
 /// agents talk" view (PRD-0011 T-004; the §19 aggregation log's smallest sibling). App-level pings
 /// keep the session inside the server's idle-reap window.
 ///
+/// With `since_secs`, the retained backlog is replayed first (PRD-0013 T-004). A dropped link
+/// (server restart / deploy) reconnects with backoff and resumes from the watermark — status goes
+/// to stderr so stdout stays a clean message stream.
+///
 /// # Errors
 ///
-/// Returns an error if the connection, authentication, or join fails, or the link drops.
-pub async fn tail(url: &str, identity: &Identity, session: &str, channel: &str) -> Res<()> {
+/// Returns an error if the first connection, authentication, or join fails, or the server rejects
+/// the stream; a transport drop after a working stream reconnects instead of erroring.
+pub async fn tail(url: &str, identity: &Identity, session: &str, channel: &str, since_secs: Option<u64>) -> Res<()> {
+    // The replay/resume watermark: server-stamped ms for history rows, local wall-clock for live
+    // rows (close enough within the slack window). `None` = live-only.
+    let mut watermark_ms: Option<i64> = since_secs.map(|secs| chrono::Utc::now().timestamp_millis().saturating_sub(i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000)));
+    let mut established = false;
+    let mut backoff = TAIL_BACKOFF_BASE;
+
+    loop {
+        match tail_once(url, identity, session, channel, &mut watermark_ms, &mut established).await {
+            Ok(()) => return Ok(()),
+            Err(err) if !established || err.downcast_ref::<TailFatal>().is_some() => return Err(err),
+            Err(_) => {
+                // Transport loss after a working stream: reconnect, don't die (PRD-0013 T-004).
+                eprintln!("⚠ connection to `{url}` lost — reconnecting (Ctrl-C to stop)");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => return Ok(()),
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(TAIL_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+/// One tail connection: connect → join → optional backlog replay → stream. Returns `Ok(())` on
+/// Ctrl-C; a [`TailFatal`] error on rejection; any other error is a retryable transport loss.
+async fn tail_once(url: &str, identity: &Identity, session: &str, channel: &str, watermark_ms: &mut Option<i64>, established: &mut bool) -> Res<()> {
     use std::io::Write as _;
 
     let mut ws = connect(url).await?;
@@ -124,13 +167,31 @@ pub async fn tail(url: &str, identity: &Identity, session: &str, channel: &str) 
     send(&mut ws, &ProtocolMessage::Join { channel: channel.to_owned(), token: None }).await?;
     match recv(&mut ws).await? {
         ProtocolMessage::Joined { channel } => {
-            // Announce readiness (and flush: stdout is block-buffered when piped).
-            let mut out = std::io::stdout();
-            writeln!(out, "tailing #{channel} as {path} — Ctrl-C to stop")?;
-            out.flush()?;
+            if *established {
+                eprintln!("✓ reconnected; resuming #{channel}");
+            } else {
+                // Announce readiness (and flush: stdout is block-buffered when piped).
+                let mut out = std::io::stdout();
+                writeln!(out, "tailing #{channel} as {path} — Ctrl-C to stop")?;
+                out.flush()?;
+                *established = true;
+            }
         }
-        ProtocolMessage::Error(err) => anyhow::bail!("join rejected: {err}"),
-        other => anyhow::bail!("unexpected response to join: {other:?}"),
+        ProtocolMessage::Error(err) => return Err(TailFatal(format!("join rejected: {err}")).into()),
+        other => return Err(TailFatal(format!("unexpected response to join: {other:?}")).into()),
+    }
+
+    // Replay the retained backlog from the watermark, minus slack — a repeated line beats a
+    // missed one. The page arrives as a History frame in the stream loop below.
+    if let Some(since) = *watermark_ms {
+        send(
+            &mut ws,
+            &ProtocolMessage::ReadSince {
+                channel: channel.to_owned(),
+                since_ms: since.saturating_sub(TAIL_RESUME_SLACK_MS),
+            },
+        )
+        .await?;
     }
 
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
@@ -142,8 +203,22 @@ pub async fn tail(url: &str, identity: &Identity, session: &str, channel: &str) 
             frame = recv_frame(&mut ws) => {
                 let mut out = std::io::stdout();
                 match frame? {
-                    ProtocolMessage::ChannelMsg { channel, from, payload } => writeln!(out, "[{channel}] {from}: {}", render_payload(&payload))?,
+                    ProtocolMessage::ChannelMsg { channel, from, payload } => {
+                        writeln!(out, "[{channel}] {from}: {}", render_payload(&payload))?;
+                        *watermark_ms = Some(chrono::Utc::now().timestamp_millis());
+                    }
                     ProtocolMessage::Whisper { from, payload, .. } => writeln!(out, "[whisper] {from}: {}", render_payload(&payload))?,
+                    ProtocolMessage::History { channel, messages } => {
+                        for message in &messages {
+                            writeln!(out, "[{channel}] {}: {}", message.from, render_payload(&message.payload))?;
+                        }
+                        if let Some(newest) = messages.iter().map(|m| m.ts_ms).max() {
+                            *watermark_ms = Some(watermark_ms.unwrap_or(newest).max(newest));
+                        }
+                    }
+                    // A mid-stream error frame is the server ending us on purpose (superseded,
+                    // revoked) — surface it and stop rather than fight to reconnect.
+                    ProtocolMessage::Error(err) => return Err(TailFatal(format!("server terminated the stream: {err}")).into()),
                     // Control frames (acks of our own pings etc.) are not part of the stream.
                     _ => continue,
                 }

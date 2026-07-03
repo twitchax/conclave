@@ -742,6 +742,113 @@ async fn server_fanout_channel_message_reaches_all_subscribers() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// PRD-0013 — retained history: read-since after a gap; visibility-uniform refusal.
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_history_read_since_returns_missed_messages_in_order() {
+    let hub = hub().await;
+    let ida = Identity::generate().unwrap();
+    let idb = Identity::generate().unwrap();
+
+    let mut a = Client::connect(&hub);
+    let pa = established_path(a.register(&ida, "aaron", "wa", "sa").await);
+    a.admin(AdminOp::CreateChannel {
+        name: "lobby".to_owned(),
+        visibility: Visibility::Public,
+    })
+    .await;
+    assert!(matches!(a.join("lobby", None).await, ProtocolMessage::Joined { .. }));
+
+    // A posts while B is entirely offline — the uat-001 gap.
+    for body in ["one", "two"] {
+        a.send(ProtocolMessage::ChannelMsg {
+            channel: "lobby".to_owned(),
+            from: pa.clone(),
+            payload: crate::protocol::Payload::Plain(body.to_owned()),
+        })
+        .await;
+        assert!(matches!(a.recv().await, ProtocolMessage::Ack { .. }));
+    }
+
+    // B arrives later, joins, and catches up from zero: both messages, oldest-first, stamped.
+    let mut b = Client::connect(&hub);
+    established_path(b.register(&idb, "david", "wd", "sb").await);
+    assert!(matches!(b.join("lobby", None).await, ProtocolMessage::Joined { .. }));
+    b.send(ProtocolMessage::ReadSince { channel: "lobby".to_owned(), since_ms: 0 }).await;
+    let (first_ts, second_ts) = match b.recv().await {
+        ProtocolMessage::History { channel, messages } => {
+            assert_eq!(channel, "lobby");
+            let bodies: Vec<_> = messages
+                .iter()
+                .map(|m| match &m.payload {
+                    crate::protocol::Payload::Plain(text) => text.clone(),
+                    other @ crate::protocol::Payload::Encrypted(_) => panic!("expected a plain payload, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(bodies, ["one", "two"], "history must be complete and oldest-first");
+            assert!(messages.iter().all(|m| m.from == pa), "history must carry the server-stamped sender path");
+            (messages[0].ts_ms, messages[1].ts_ms)
+        }
+        other => panic!("expected a History page, got {other:?}"),
+    };
+    assert!(first_ts <= second_ts, "server stamps must be monotonic-ish");
+
+    // The watermark is exclusive: asking since the first message returns only the second.
+    b.send(ProtocolMessage::ReadSince {
+        channel: "lobby".to_owned(),
+        since_ms: first_ts,
+    })
+    .await;
+    match b.recv().await {
+        ProtocolMessage::History { messages, .. } => {
+            assert_eq!(messages.len(), 1, "the watermark message itself must not be re-delivered");
+            assert_eq!(messages[0].ts_ms, second_ts);
+        }
+        other => panic!("expected a History page, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn server_history_is_refused_visibility_uniformly() {
+    let hub = hub().await;
+    let ida = Identity::generate().unwrap();
+    let idb = Identity::generate().unwrap();
+
+    let mut a = Client::connect(&hub);
+    established_path(a.register(&ida, "aaron", "wa", "sa").await);
+    a.admin(AdminOp::CreateChannel {
+        name: "secret".to_owned(),
+        visibility: Visibility::Private,
+    })
+    .await;
+
+    // A non-member reading a private channel and reading a nonexistent channel must be
+    // indistinguishable (PRD-0007 visibility uniformity, inherited by history).
+    let mut b = Client::connect(&hub);
+    established_path(b.register(&idb, "david", "wd", "sb").await);
+    b.send(ProtocolMessage::ReadSince {
+        channel: "secret".to_owned(),
+        since_ms: 0,
+    })
+    .await;
+    let private_refusal = match b.recv().await {
+        ProtocolMessage::Error(err) => err.to_string().replace("secret", "<c>"),
+        other => panic!("a non-member history read must be refused, got {other:?}"),
+    };
+    b.send(ProtocolMessage::ReadSince {
+        channel: "no-such-channel".to_owned(),
+        since_ms: 0,
+    })
+    .await;
+    let missing_refusal = match b.recv().await {
+        ProtocolMessage::Error(err) => err.to_string().replace("no-such-channel", "<c>"),
+        other => panic!("a history read on a missing channel must be refused, got {other:?}"),
+    };
+    assert_eq!(private_refusal, missing_refusal, "history refusals must not leak channel existence");
+}
+
 #[tokio::test]
 async fn server_fanout_whisper_reaches_exactly_one_session() {
     let hub = hub().await;
