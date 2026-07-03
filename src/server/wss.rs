@@ -60,7 +60,7 @@ pub async fn serve(config: ServerConfig) -> Void {
             tracing::warn!(admin = %name, "admin username is unpinned and can be squatted by the first client to register it; pin it as `--admin <user>=<pubkey>`");
         }
     }
-    let hub = Hub::new(store, config.admins);
+    let hub = Hub::new(store, config.admins).await?;
 
     spawn_reaper(Arc::clone(&hub));
 

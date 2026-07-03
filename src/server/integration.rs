@@ -25,7 +25,7 @@ use super::{hub::Hub, session::handle_connection};
 
 async fn hub_with(admins: &[(&str, Option<&str>)]) -> Arc<Hub> {
     let store = crate::store::Store::open_in_memory().await.unwrap();
-    Hub::new(store, admins.iter().map(|(user, pin)| ((*user).to_owned(), pin.map(str::to_owned))).collect())
+    Hub::new(store, admins.iter().map(|(user, pin)| ((*user).to_owned(), pin.map(str::to_owned))).collect()).await.unwrap()
 }
 
 async fn hub() -> Arc<Hub> {

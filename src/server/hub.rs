@@ -1,9 +1,10 @@
 //! The transport-agnostic server core: durable store + in-memory presence, subscriptions,
 //! bans, and the fan-out router (DESIGN.md §13, §14).
 //!
-//! The [`Hub`] owns the single source of runtime truth. Durable identity / channel state lives in
-//! the embedded [`Store`]; live presence, channel subscriptions, and channel bans are in-memory
-//! maps keyed by full [`SessionPath`] (never persisted, DESIGN.md §15). Each live session registers
+//! The [`Hub`] owns the single source of runtime truth. Durable identity / channel / ban state
+//! lives in the embedded [`Store`]; live presence and channel subscriptions are in-memory maps
+//! keyed by full [`SessionPath`] (never persisted, DESIGN.md §15), and bans are write-through:
+//! durable in the store, mirrored in memory for lock-guarded checks. Each live session registers
 //! an outbound frame channel so the router can push channel fan-out and whispers to it. Every method
 //! is transport-free — the session driver (see [`super::session`]) and the axum adapter (see
 //! [`super::wss`]) both drive the same `Hub`, and the unit tests drive it directly.
@@ -59,7 +60,8 @@ struct HubState {
     sessions: HashMap<SessionPath, SessionEntry>,
     /// Channel → subscribed session paths (the fan-out index).
     subscriptions: HashMap<String, HashSet<SessionPath>>,
-    /// Channel → banned usernames (in-memory in v1; resets on restart).
+    /// Channel → banned usernames — the in-memory mirror of the store's durable `ban` table,
+    /// loaded at startup and written through on ban/unban (so checks stay lock-guarded, #30).
     bans: HashMap<String, HashSet<String>>,
 }
 
@@ -71,13 +73,23 @@ pub(crate) struct Hub {
 }
 
 impl Hub {
-    /// Builds a shared hub over `store`, with `admins` as the server-wide admin allowlist (§7).
-    pub(crate) fn new(store: Store, admins: super::AdminAllowlist) -> Arc<Self> {
-        Arc::new(Self {
+    /// Builds a shared hub over `store`, with `admins` as the server-wide admin allowlist (§7),
+    /// loading the persisted channel bans into the in-memory view (so `is_banned` stays a
+    /// lock-guarded, await-free check — see `subscribe`, #30) before serving.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the persisted bans cannot be loaded.
+    pub(crate) async fn new(store: Store, admins: super::AdminAllowlist) -> crate::base::Res<Arc<Self>> {
+        let mut bans: HashMap<String, HashSet<String>> = HashMap::new();
+        for (channel, user) in store.list_bans().await? {
+            bans.entry(channel).or_default().insert(user);
+        }
+        Ok(Arc::new(Self {
             store,
             admins,
-            state: Mutex::new(HubState::default()),
-        })
+            state: Mutex::new(HubState { bans, ..HubState::default() }),
+        }))
     }
 
     fn state(&self) -> MutexGuard<'_, HubState> {
@@ -382,7 +394,7 @@ impl Hub {
             AdminOp::AclAdd { channel, user: target } => {
                 self.authorize_channel_admin(&channel, user).await?;
                 self.store.add_channel_member(&channel, &target).await.map_err(internal)?;
-                self.remove_ban(&channel, &target);
+                self.remove_ban(&channel, &target).await?;
                 Ok(ack(target))
             }
             AdminOp::AclRemove { channel, user: target } => {
@@ -423,7 +435,7 @@ impl Hub {
             AdminOp::Ban { channel, user: target } => {
                 self.authorize_channel_admin(&channel, user).await?;
                 self.store.remove_channel_member(&channel, &target).await.map_err(internal)?;
-                self.add_ban(&channel, &target);
+                self.add_ban(&channel, &target).await?;
                 self.unsubscribe_user(&target, &channel);
                 Ok(ack(target))
             }
@@ -613,14 +625,21 @@ impl Hub {
         self.state().bans.get(channel).is_some_and(|banned| banned.contains(user))
     }
 
-    fn add_ban(&self, channel: &str, user: &str) {
+    /// Records a ban durably, then mirrors it in memory (write-through: the store survives a
+    /// restart, the in-memory set serves the lock-guarded checks).
+    async fn add_ban(&self, channel: &str, user: &str) -> Result<(), ProtocolError> {
+        self.store.add_ban(channel, user).await.map_err(internal)?;
         self.state().bans.entry(channel.to_owned()).or_default().insert(user.to_owned());
+        Ok(())
     }
 
-    fn remove_ban(&self, channel: &str, user: &str) {
+    /// Lifts a ban durably, then in memory (the unban path: `AclAdd` re-admits a banned user).
+    async fn remove_ban(&self, channel: &str, user: &str) -> Result<(), ProtocolError> {
+        self.store.remove_ban(channel, user).await.map_err(internal)?;
         if let Some(banned) = self.state().bans.get_mut(channel) {
             banned.remove(user);
         }
+        Ok(())
     }
 
     /// Removes a session and its subscriptions, returning the entry (shared by detach and kill).
@@ -710,7 +729,7 @@ mod tests {
         let store = Store::open_in_memory().await.unwrap();
         store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
         store.create_invite("ops", "tok", token_uses, expires_at, "aaron").await.unwrap();
-        Hub::new(store, HashMap::new())
+        Hub::new(store, HashMap::new()).await.unwrap()
     }
 
     fn attach_session(hub: &Arc<Hub>, user: &str) -> SessionPath {
@@ -725,7 +744,7 @@ mod tests {
     async fn fanout_drops_a_slow_consumer_instead_of_growing_its_queue() {
         let store = Store::open_in_memory().await.unwrap();
         store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
-        let hub = Hub::new(store, HashMap::new());
+        let hub = Hub::new(store, HashMap::new()).await.unwrap();
 
         // aaron posts; bob is a slow consumer with a tiny, never-drained outbound queue.
         let aaron = attach_session(&hub, "aaron");
@@ -766,15 +785,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bans_survive_a_server_restart() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
+
+        // First server lifetime: aaron (the channel admin) bans bob.
+        let hub = Hub::new(store.clone(), HashMap::new()).await.unwrap();
+        let ack = hub
+            .admin(
+                "aaron",
+                AdminOp::Ban {
+                    channel: "ops".to_owned(),
+                    user: "bob".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ack, ProtocolMessage::Ack { .. }));
+        drop(hub);
+
+        // Second lifetime over the same durable store: the ban still holds.
+        let hub = Hub::new(store, HashMap::new()).await.unwrap();
+        let bob = attach_session(&hub, "bob");
+        assert!(hub.join("bob", &bob, "ops", None).await.is_err(), "a persisted ban must survive a server restart");
+    }
+
+    #[tokio::test]
     async fn subscribe_re_checks_the_ban_atomically() {
         let store = Store::open_in_memory().await.unwrap();
         store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
-        let hub = Hub::new(store, HashMap::new());
+        let hub = Hub::new(store, HashMap::new()).await.unwrap();
         let bob = attach_session(&hub, "bob");
 
         // A ban landing after join's early check (the TOCTOU window) is still enforced by the
         // re-check inside `subscribe`, under the same lock as the insert (#30).
-        hub.add_ban("ops", "bob");
+        hub.add_ban("ops", "bob").await.unwrap();
         assert!(!hub.subscribe(&bob, "ops"), "subscribe must refuse a banned user");
         assert!(!hub.subscribers("ops").contains(&bob), "a banned user must not end up subscribed");
     }
@@ -890,7 +935,7 @@ mod tests {
         store.create_channel("victim-ops", Visibility::Private, "victim").await.unwrap();
         store.create_channel("lobby", Visibility::Public, "aaron").await.unwrap();
         store.add_channel_member("lobby", "victim").await.unwrap();
-        let hub = Hub::new(store, HashMap::from([("root".to_owned(), None)]));
+        let hub = Hub::new(store, HashMap::from([("root".to_owned(), None)])).await.unwrap();
 
         hub.admin("root", AdminOp::UserRemove { username: "victim".to_owned() }).await.unwrap();
 
@@ -905,7 +950,7 @@ mod tests {
     async fn invite_create_with_absurd_expiry_errors_instead_of_panicking() {
         let store = Store::open_in_memory().await.unwrap();
         store.create_channel("ops", Visibility::Private, "aaron").await.unwrap();
-        let hub = Hub::new(store, HashMap::new());
+        let hub = Hub::new(store, HashMap::new()).await.unwrap();
 
         let result = hub
             .admin(

@@ -34,6 +34,7 @@ DEFINE INDEX IF NOT EXISTS machine_user_name ON machine FIELDS user, name UNIQUE
 DEFINE INDEX IF NOT EXISTS channel_name ON channel FIELDS name UNIQUE;
 DEFINE INDEX IF NOT EXISTS invite_token ON invite FIELDS token UNIQUE;
 DEFINE INDEX IF NOT EXISTS membership_channel_user ON membership FIELDS channel, user UNIQUE;
+DEFINE INDEX IF NOT EXISTS ban_channel_user ON ban FIELDS channel, user UNIQUE;
 ";
 
 /// A registered account (`username` unique per server, DESIGN.md §15).
@@ -166,7 +167,9 @@ fn is_write_conflict(err: &surrealdb::Error) -> bool {
     err.to_string().to_lowercase().contains("conflict")
 }
 
-/// The embedded store: a thin typed repository over an embedded `SurrealDB` instance.
+/// The embedded store: a thin typed repository over an embedded `SurrealDB` instance. Cloning
+/// yields another handle to the same database (the inner client is a shared handle).
+#[derive(Clone)]
 pub struct Store {
     db: Surreal<Db>,
 }
@@ -479,6 +482,68 @@ impl Store {
         response.take(0).context("failed to decode membership users")
     }
 
+    /// Records a channel ban for `user`; idempotent (banning twice is a no-op). Durable so bans
+    /// survive a server restart; the hub mirrors them in memory for its lock-guarded checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert keeps conflicting past the retry cap or otherwise fails.
+    pub async fn add_ban(&self, channel: &str, user: &str) -> Void {
+        for attempt in 0..MAX_WRITE_ATTEMPTS {
+            let outcome = self
+                .db
+                .query("INSERT INTO ban { channel: $channel, user: $user } ON DUPLICATE KEY UPDATE channel = $channel")
+                .bind(Membership {
+                    channel: channel.to_owned(),
+                    user: user.to_owned(),
+                })
+                .await
+                .and_then(surrealdb::IndexedResults::check);
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(e) if is_write_conflict(&e) && attempt + 1 < MAX_WRITE_ATTEMPTS => tokio::task::yield_now().await,
+                Err(e) => return Err(anyhow::Error::new(e).context("failed to add ban")),
+            }
+        }
+        anyhow::bail!("adding a ban exhausted {MAX_WRITE_ATTEMPTS} write-conflict retries")
+    }
+
+    /// Lifts a channel ban; idempotent (removing an absent ban is a no-op).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete keeps conflicting past the retry cap or otherwise fails.
+    pub async fn remove_ban(&self, channel: &str, user: &str) -> Void {
+        for attempt in 0..MAX_WRITE_ATTEMPTS {
+            let outcome = self
+                .db
+                .query("DELETE ban WHERE channel = $channel AND user = $user")
+                .bind(Membership {
+                    channel: channel.to_owned(),
+                    user: user.to_owned(),
+                })
+                .await
+                .and_then(surrealdb::IndexedResults::check);
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(e) if is_write_conflict(&e) && attempt + 1 < MAX_WRITE_ATTEMPTS => tokio::task::yield_now().await,
+                Err(e) => return Err(anyhow::Error::new(e).context("failed to remove ban")),
+            }
+        }
+        anyhow::bail!("removing a ban exhausted {MAX_WRITE_ATTEMPTS} write-conflict retries")
+    }
+
+    /// Every persisted `(channel, user)` ban, for loading the hub's in-memory view at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_bans(&self) -> Res<Vec<(String, String)>> {
+        let mut response = self.db.query("SELECT channel, user FROM ban").await.context("failed to list bans")?;
+        let rows: Vec<Membership> = response.take(0).context("failed to decode ban rows")?;
+        Ok(rows.into_iter().map(|row| (row.channel, row.user)).collect())
+    }
+
     /// The names of the channels created (and administered) by `user`.
     ///
     /// # Errors
@@ -557,6 +622,13 @@ impl Store {
             .context("failed to migrate channel invites")?
             .check()
             .context("invite rename reported an error")?;
+        self.db
+            .query("UPDATE ban SET channel = $new WHERE channel = $old")
+            .bind(Rename { old: old.to_owned(), new: new.to_owned() })
+            .await
+            .context("failed to migrate channel bans")?
+            .check()
+            .context("ban rename reported an error")?;
         Ok(())
     }
 
@@ -589,6 +661,13 @@ impl Store {
             .context("failed to delete channel invites")?
             .check()
             .context("invite delete reported an error")?;
+        self.db
+            .query("DELETE ban WHERE channel = $channel")
+            .bind(ByChannel { channel: name.to_owned() })
+            .await
+            .context("failed to delete channel bans")?
+            .check()
+            .context("ban delete reported an error")?;
         Ok(())
     }
 
@@ -887,6 +966,38 @@ mod tests {
 
         store.rename_channel("ops", "operations").await.unwrap();
         assert_eq!(store.get_invite("tok").await.unwrap().unwrap().channel, "operations", "an invite must follow its renamed channel");
+    }
+
+    #[tokio::test]
+    async fn ban_add_remove_and_list_round_trip() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
+
+        store.add_ban("ops", "bob").await.unwrap();
+        store.add_ban("ops", "bob").await.unwrap(); // idempotent
+        store.add_ban("ops", "mallory").await.unwrap();
+
+        let mut bans = store.list_bans().await.unwrap();
+        bans.sort();
+        assert_eq!(bans, vec![("ops".to_owned(), "bob".to_owned()), ("ops".to_owned(), "mallory".to_owned())]);
+
+        store.remove_ban("ops", "bob").await.unwrap();
+        assert_eq!(store.list_bans().await.unwrap(), vec![("ops".to_owned(), "mallory".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn bans_follow_delete_and_rename() {
+        let store = store().await;
+        store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
+        store.add_ban("ops", "bob").await.unwrap();
+
+        // A rename migrates the ban with the channel.
+        store.rename_channel("ops", "operations").await.unwrap();
+        assert_eq!(store.list_bans().await.unwrap(), vec![("operations".to_owned(), "bob".to_owned())]);
+
+        // A delete drops the channel's bans so a future same-named channel starts clean.
+        store.delete_channel("operations").await.unwrap();
+        assert!(store.list_bans().await.unwrap().is_empty(), "deleting a channel must drop its bans");
     }
 
     #[tokio::test]
