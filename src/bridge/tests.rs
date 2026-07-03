@@ -405,3 +405,61 @@ fn bridge_link_up_resubscribe_ack_is_consumed_silently() {
     harness.core.handle_inbound("s1", ProtocolMessage::Joined { channel: "ops".to_owned() });
     assert!(harness.to_mcp_rx.try_recv().is_err(), "a re-subscribe Joined must not answer a tool call");
 }
+
+// -----------------------------------------------------------------------------
+// PRD-0008 T-003 — confirm joins before recording them locally.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn bridge_join_records_only_after_confirmation() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(8),
+        name: "join_channel".to_owned(),
+        args: json!({ "channel": "ops" }),
+    });
+    assert!(!harness.joined.lock().unwrap().contains("ops"), "a join must not be recorded before the server confirms");
+
+    harness.core.handle_inbound("s1", ProtocolMessage::Joined { channel: "ops".to_owned() });
+    assert!(harness.joined.lock().unwrap().contains("ops"), "a confirmed join must be recorded");
+}
+
+#[test]
+fn bridge_rejected_join_is_not_recorded() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(4),
+        name: "join_channel".to_owned(),
+        args: json!({ "channel": "secret" }),
+    });
+    harness.core.handle_inbound("s1", ProtocolMessage::Error(ProtocolError::NotFound("secret".to_owned())));
+
+    assert!(!harness.joined.lock().unwrap().contains("secret"), "a rejected join must not be recorded");
+    let result = harness.to_mcp_rx.try_recv().unwrap();
+    assert_eq!(result.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+}
+
+#[test]
+fn bridge_link_state_changes_notify_the_session() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    // A drop surfaces a disconnect notice to the session...
+    harness.core.link_down("s1");
+    let note = harness.to_mcp_rx.try_recv().unwrap();
+    assert!(
+        note.pointer("/params/content").and_then(Value::as_str).unwrap().to_lowercase().contains("disconnected"),
+        "a link drop must surface a disconnect notice",
+    );
+
+    // ...but a repeated drop does not re-notify...
+    harness.core.link_down("s1");
+    assert!(harness.to_mcp_rx.try_recv().is_err(), "repeated disconnects notify only once");
+
+    // ...and a reconnect surfaces a reconnect notice.
+    harness.core.link_up("s1");
+    let note = harness.to_mcp_rx.try_recv().unwrap();
+    assert!(
+        note.pointer("/params/content").and_then(Value::as_str).unwrap().to_lowercase().contains("reconnected"),
+        "a reconnect must surface a reconnect notice",
+    );
+}

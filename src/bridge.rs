@@ -152,6 +152,9 @@ struct BridgeCore {
     servers: HashMap<String, ServerHandle>,
     /// Per-server in-order queue of responses awaited from that server (tool calls + re-subscribes).
     pending: HashMap<String, VecDeque<Pending>>,
+    /// Servers the session has been told are disconnected — so link state surfaces once per drop and
+    /// a reconnect is announced (PRD-0008 T-003, #21).
+    link_down_notified: HashSet<String>,
     /// Servers on which the authenticated user is an admin (from `ServerInfo`) — gates admin tools.
     admin_servers: HashSet<String>,
 }
@@ -165,6 +168,7 @@ impl BridgeCore {
             sink,
             servers: HashMap::new(),
             pending: HashMap::new(),
+            link_down_notified: HashSet::new(),
             admin_servers: HashSet::new(),
         }
     }
@@ -399,10 +403,8 @@ impl BridgeCore {
             }
         }
 
-        if let Some(handle) = self.servers.get(&server) {
-            handle.joined.lock().expect("joined mutex poisoned").insert(channel.to_owned());
-        }
-        // Deferred: the result is sent when the server's `Joined` / `Error` arrives.
+        // Deferred: the result — and recording the channel as joined (done on the `Joined` ack, so a
+        // rejected join isn't pre-recorded, PRD-0008 T-003 #20) — waits for the server to confirm.
         self.defer(id, &server, None);
         self.send_to_server(&server, ProtocolMessage::Join { channel: channel.to_owned(), token });
     }
@@ -535,7 +537,13 @@ impl BridgeCore {
         match frame {
             ProtocolMessage::ChannelMsg { channel, from, payload } => self.inject(server, Some(channel), from, payload),
             ProtocolMessage::Whisper { from, payload, .. } => self.inject(server, None, from, payload),
-            ProtocolMessage::Joined { channel } => self.resolve_pending(server, &format!("joined {channel}")),
+            ProtocolMessage::Joined { channel } => {
+                // Record the subscription only now that the server has confirmed it (#20).
+                if let Some(handle) = self.servers.get(server) {
+                    handle.joined.lock().expect("joined mutex poisoned").insert(channel.clone());
+                }
+                self.resolve_pending(server, &format!("joined {channel}"));
+            }
             ProtocolMessage::ChannelList { channels } => self.resolve_pending(server, &format_channels(&channels)),
             ProtocolMessage::Presence { channel, sessions } => self.resolve_pending(server, &format_presence(channel.as_deref(), &sessions)),
             ProtocolMessage::Ack { detail } => self.resolve_pending(server, detail.as_deref().unwrap_or("ok")),
@@ -586,19 +594,26 @@ impl BridgeCore {
             Some(Pending::Tool { id, .. }) => self.send_mcp(mcp::tool_error_result(&id, &error.to_string())),
             // A re-subscribe `Join` that failed (e.g. the channel was deleted) — consume silently.
             Some(Pending::Resubscribe) => {}
-            None => {
-                // A stray error with nothing pending — surface it as a notice.
-                let mut meta = std::collections::BTreeMap::new();
-                meta.insert("server".to_owned(), server.to_owned());
-                meta.insert("kind".to_owned(), "error".to_owned());
-                self.send_mcp(mcp::channel_notification(&format!("Server `{server}` error: {error}"), &meta));
-            }
+            // A stray error with nothing pending — surface it as a notice.
+            None => self.notify(server, "error", &format!("Server `{server}` error: {error}")),
         }
     }
 
-    /// On a fresh connection, re-subscribe every joined channel, enqueuing a silent `Resubscribe`
-    /// per `Join` so its `Joined` ack never resolves an unrelated tool call (PRD-0008 T-001).
+    /// Surfaces a system notice (link state, stray errors) into the session as a channel notification.
+    fn notify(&self, server: &str, kind: &str, text: &str) {
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("server".to_owned(), server.to_owned());
+        meta.insert("kind".to_owned(), kind.to_owned());
+        self.send_mcp(mcp::channel_notification(text, &meta));
+    }
+
+    /// On a fresh connection, announce a reconnect (if the session was told we dropped) and
+    /// re-subscribe every joined channel, enqueuing a silent `Resubscribe` per `Join` so its
+    /// `Joined` ack never resolves an unrelated tool call (PRD-0008 T-001/T-003).
     fn link_up(&mut self, server: &str) {
+        if self.link_down_notified.remove(server) {
+            self.notify(server, "link", &format!("Reconnected to `{server}`."));
+        }
         let Some(handle) = self.servers.get(server) else { return };
         let channels: Vec<String> = handle.joined.lock().expect("joined mutex poisoned").iter().cloned().collect();
         for channel in channels {
@@ -607,14 +622,19 @@ impl BridgeCore {
         }
     }
 
-    /// On a link drop, fail every pending tool call for `server` (so a deferred call never hangs);
-    /// re-subscribe entries are simply dropped (PRD-0008 T-002).
+    /// On a link drop, fail every pending tool call for `server` (so a deferred call never hangs),
+    /// then surface the disconnect to the session once (PRD-0008 T-002/T-003). Re-subscribe entries
+    /// are simply dropped.
     fn link_down(&mut self, server: &str) {
-        let Some(queue) = self.pending.remove(server) else { return };
-        for entry in queue {
-            if let Pending::Tool { id, .. } = entry {
-                self.send_mcp(mcp::tool_error_result(&id, &format!("connection to `{server}` lost; retry")));
+        if let Some(queue) = self.pending.remove(server) {
+            for entry in queue {
+                if let Pending::Tool { id, .. } = entry {
+                    self.send_mcp(mcp::tool_error_result(&id, &format!("connection to `{server}` lost; retry")));
+                }
             }
+        }
+        if self.link_down_notified.insert(server.to_owned()) {
+            self.notify(server, "link", &format!("Disconnected from `{server}` — reconnecting."));
         }
     }
 
