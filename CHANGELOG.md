@@ -6,7 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
-## [Unreleased]
+## [0.2.2] - 2026-07-03
+
+Everything learned from the first live multi-session test: the supersede-storm class of bugs
+(PRD-0012), a tool list that tracks reality (PRD-0015), and the CLI exits those fights needed.
 
 ### Added
 
