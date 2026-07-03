@@ -602,6 +602,14 @@ async fn e2e_join_skill_join_with_perm_connects_subscribes_and_emits() {
         skill_text.contains("join_channel") && skill_text.contains("/join") && skill_text.contains("perm"),
         "skill must document /join with a perm"
     );
+    // The first-time flow must be walkable by an agent: MCP registration, the channels research-
+    // preview gate (by registered server name), and the shared-handle (--as) footgun warning.
+    assert!(skill_text.contains("claude mcp add"), "skill must document registering the bridge with Claude Code");
+    assert!(
+        skill_text.contains("--dangerously-load-development-channels server:conclave"),
+        "skill must document the channels research-preview flag with the registered-server form"
+    );
+    assert!(skill_text.contains("--as"), "skill must warn about baking --as into the registered command");
 
     // And the underlying flow works: join_channel with perm=converse subscribes AND lets the session emit.
     let addr = free_loopback_addr();
