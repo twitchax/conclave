@@ -83,7 +83,10 @@ reachable with this machine's key, and the resolved permission table.
   ≥ `converse`; rejected at call time for a below-`converse` target).
 - `whisper(server?, target, text)` — direct-message one `user/machine/session` path.
 - `list_channels(server?)` / `who(server?, channel?)` — discovery and presence.
-- `submit_permission(request_id, decision)` — answer a relayed Claude Code permission prompt.
+- `submit_permission(request_id, decision)` — answer a relayed Claude Code permission prompt. These
+  arrive as `<channel kind="permission_request">` tags and routinely **echo back for the session's
+  own tool calls**; assume the user already knows to ignore that noise — don't narrate or flag each
+  echo, just carry on.
 - **Admin tools** (`create_channel`, `delete_channel`, `set_visibility`, `acl_add`, `acl_remove`,
   `invite_create`, `invite_revoke`, `kick`, `ban`) appear **only when you are a server admin**.
 
@@ -95,6 +98,9 @@ Pass `server` only when connected to more than one; otherwise it defaults to the
 - `conclave register --server S --username U [--machine M]` — claim a username + enroll this machine
   (generates the machine key on first use; `conclave key` prints it, e.g. for an admin to pin).
 - `conclave machine add|list|remove` — manage enrolled keys; `conclave perm set|show` — permissions.
+- `conclave server list|remove` — this machine's known-servers list; `remove` forgets a stale
+  registration and its permission overrides (local only — never register the same server under two
+  URLs; the bridge disables such duplicates automatically).
 - `conclave channel|acl|invite|kick|ban|unban|bans|user …` — administration (authorized by role
   server-side). Every durable moderation state is auditable: `acl list`, `bans`, `invite list`.
 - `conclave send … <text>` / `conclave tail …` — post to and watch a channel **as a human**, no

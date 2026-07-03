@@ -212,9 +212,13 @@ async fn server_reconnect_supersedes_a_stale_live_handle() {
     let path = established_path(b.authenticate(&id, "razel").await);
     assert_eq!(path, SessionPath::new("aaron", "workstation", "razel"));
 
-    // ...and the superseded session is force-dropped (a termination frame, then its transport closes).
+    // ...and the superseded session is force-dropped with a *self-describing* reason — a generic
+    // "session terminated" reads like an auth failure and hides the mechanism (PRD-0012 T-002).
     match a.try_recv().await {
-        Some(ProtocolMessage::Error(_)) | None => {}
+        Some(ProtocolMessage::Error(err)) => {
+            assert!(err.to_string().contains("superseded"), "the termination frame must say the session was superseded, got: {err}");
+        }
+        None => panic!("the superseded session must receive a termination frame before its transport closes"),
         other => panic!("the superseded session must be terminated, got {other:?}"),
     }
 }

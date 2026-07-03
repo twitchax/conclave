@@ -99,6 +99,7 @@ async fn execute(cli: &Cli) -> Void {
         Command::Key => run_key(dir),
         Command::Register(args) => run_register(dir, args).await,
         Command::Machine { command } => run_machine(dir, command).await,
+        Command::Server { command } => run_server(dir, command),
         Command::Join(args) => run_join(dir, args).await,
         Command::Perm { command } => run_perm(dir, command),
         Command::Channel { command } => run_channel(dir, command).await,
@@ -299,6 +300,35 @@ async fn run_join(explicit: Option<&PathBuf>, args: &JoinArgs) -> Void {
     }
 
     eprintln!("note: verified access and set the local permission; your live session subscribes via the /conclave skill's join_channel tool.");
+    Ok(())
+}
+
+/// Handles `conclave server …`: local known-servers management (PRD-0012 T-004). Purely local —
+/// nothing here talks to a server; `remove` is the CLI exit for a stranded registration (the
+/// state behind the two-URLs-one-server supersede storm).
+fn run_server(explicit: Option<&PathBuf>, command: &ServerCommand) -> Void {
+    let dir = config_dir(explicit)?;
+    match command {
+        ServerCommand::List => {
+            let config = identity::load_config(&dir)?;
+            if config.servers.is_empty() {
+                println!("no servers registered (see `conclave register`)");
+            }
+            for registration in &config.servers {
+                println!("{}\t{}/{}", registration.url, registration.username, registration.machine);
+            }
+        }
+        ServerCommand::Remove { url } => {
+            let mut config = identity::load_config(&dir)?;
+            let servers_before = config.servers.len();
+            config.servers.retain(|r| r.url != *url);
+            anyhow::ensure!(config.servers.len() < servers_before, "no registration for `{url}` (see `conclave server list`)");
+            let overrides_before = config.overrides.len();
+            config.overrides.retain(|o| o.server != *url);
+            identity::save_config(&dir, &config)?;
+            println!("✓ forgot `{url}` ({} permission override(s) removed)", overrides_before - config.overrides.len());
+        }
+    }
     Ok(())
 }
 
@@ -590,6 +620,11 @@ enum Command {
         #[command(subcommand)]
         command: MachineCommand,
     },
+    /// Manage this machine's server registrations (the local known-servers list).
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
+    },
     /// Join a channel on a server and subscribe this session to it.
     Join(JoinArgs),
     /// Inspect or set local per-channel autonomy (permission) levels.
@@ -652,6 +687,7 @@ impl Command {
             Command::Key => "key",
             Command::Register(_) => "register",
             Command::Machine { .. } => "machine",
+            Command::Server { .. } => "server",
             Command::Join(_) => "join",
             Command::Perm { .. } => "perm",
             Command::Channel { .. } => "channel",
@@ -721,6 +757,18 @@ struct RegisterArgs {
     /// Machine name for this key (defaults to the hostname).
     #[arg(long)]
     machine: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServerCommand {
+    /// List the servers this machine is registered on.
+    List,
+    /// Forget a server registration and its permission overrides — local only; the account and
+    /// machine enrollment on the server itself are untouched.
+    Remove {
+        /// The server URL to forget.
+        url: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

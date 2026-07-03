@@ -8,8 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file 
 
 ## [Unreleased]
 
+### Added
+
+- **`conclave server list` / `conclave server remove <url>`.** Local known-servers management —
+  `remove` forgets a registration *and* its permission overrides, the CLI exit for a stranded
+  double-registration that previously required hand-editing `config.toml`.
+
 ### Fixed
 
+- **Same-server supersede storm (PRD-0012).** A machine registered on one server under two URLs
+  (e.g. fly.dev + custom domain) running a bare `conclave bridge` had its two links evict each
+  other's session in a hot loop. Three-part fix: the server now stamps a persistent instance ID on
+  the WS upgrade (`x-conclave-server-id`) and the bridge disables a duplicate URL pre-auth with a
+  single notice; the reconnect backoff resets only after a link stays up 30s (an instantly-killed
+  connect keeps backing off); and force-drop reasons self-describe ("session superseded…",
+  "machine key revoked", "idle timeout…") instead of a generic "session terminated".
 - One-shot CLI verbs now die quietly on SIGPIPE (e.g. `conclave completions bash | head`) instead
   of panicking with `BrokenPipe`; `serve`/`bridge` keep their graceful write-error shutdown paths.
 

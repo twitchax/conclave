@@ -44,6 +44,10 @@ impl Constant {
     /// The wire protocol version negotiated at connect time. Peers advertising an
     /// incompatible version are rejected or upgraded (DESIGN.md §13).
     pub const PROTOCOL_VERSION: u32 = 1;
+    /// The HTTP header on the WS upgrade response carrying the server's persistent instance ID,
+    /// so a bridge can recognize the same server reached under two URLs (PRD-0012 T-003). Rides
+    /// the upgrade — out-of-band of the wire protocol — so old peers are unaffected.
+    pub const SERVER_ID_HEADER: &'static str = "x-conclave-server-id";
     /// The separator between the components of a [`SessionPath`] (`user/machine/session`).
     pub const SESSION_PATH_SEPARATOR: char = '/';
 }

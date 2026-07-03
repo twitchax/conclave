@@ -35,7 +35,15 @@ DEFINE INDEX IF NOT EXISTS channel_name ON channel FIELDS name UNIQUE;
 DEFINE INDEX IF NOT EXISTS invite_token ON invite FIELDS token UNIQUE;
 DEFINE INDEX IF NOT EXISTS membership_channel_user ON membership FIELDS channel, user UNIQUE;
 DEFINE INDEX IF NOT EXISTS ban_channel_user ON ban FIELDS channel, user UNIQUE;
+DEFINE TABLE IF NOT EXISTS meta;
 ";
+
+/// Server-lifetime metadata, held as the single fixed record `meta:server` (PRD-0012 T-003).
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct MetaRecord {
+    /// The server's persistent random instance identifier.
+    pub instance_id: String,
+}
 
 /// A registered account (`username` unique per server, DESIGN.md §15).
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -204,6 +212,33 @@ impl Store {
     async fn insert<T: SurrealValue>(&self, table: &str, record: T) -> Void {
         let _created: Option<Value> = self.db.create(table.to_owned()).content(record).await.with_context(|| format!("failed to insert into `{table}`"))?;
         Ok(())
+    }
+
+    /// Returns the server's persistent instance ID, generating and storing one on first call.
+    ///
+    /// The ID is what lets a bridge recognize the same server reached under two different URLs
+    /// (PRD-0012 T-003); it is random, carries no meaning, and never changes for a data dir.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read or the first-boot write fails.
+    pub async fn instance_id(&self) -> Res<String> {
+        let mut response = self.db.query("SELECT * OMIT id FROM meta").await.context("failed to query server meta")?;
+        let rows: Vec<MetaRecord> = response.take(0).context("failed to decode server meta")?;
+        if let Some(meta) = rows.into_iter().next() {
+            return Ok(meta.instance_id);
+        }
+
+        let id = crate::identity::generate_token()?;
+        // A fixed record id makes first-boot generation race-free: a concurrent second writer
+        // errors on the existing record and re-reads instead of minting a divergent ID.
+        let created: Result<Option<MetaRecord>, _> = self.db.create(("meta", "server")).content(MetaRecord { instance_id: id.clone() }).await;
+        if created.is_ok() {
+            return Ok(id);
+        }
+        let mut response = self.db.query("SELECT * OMIT id FROM meta").await.context("failed to re-query server meta")?;
+        let rows: Vec<MetaRecord> = response.take(0).context("failed to decode server meta")?;
+        rows.into_iter().next().map(|meta| meta.instance_id).context("server meta write raced but no record exists")
     }
 
     /// Creates a user, enforcing the unique-username constraint.
@@ -816,6 +851,34 @@ mod tests {
 
     async fn store() -> Store {
         Store::open_in_memory().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn store_instance_id_is_stable_across_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let first = {
+            let store = Store::open(dir.path()).await.unwrap();
+            let id = store.instance_id().await.unwrap();
+            assert!(!id.is_empty());
+            // Generated once, returned verbatim thereafter.
+            assert_eq!(store.instance_id().await.unwrap(), id);
+            id
+        };
+
+        // The ID must survive a server restart — it is what lets a bridge recognize the same
+        // server behind two URLs (PRD-0012 T-003). SurrealKV releases its file lock
+        // asynchronously after drop, so the reopen polls (bounded) until the lock frees.
+        let reopened = 'reopen: {
+            for _ in 0..50 {
+                if let Ok(store) = Store::open(dir.path()).await {
+                    break 'reopen store;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!("the store never became reopenable after drop");
+        };
+        assert_eq!(reopened.instance_id().await.unwrap(), first);
     }
 
     #[tokio::test]

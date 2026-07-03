@@ -12,7 +12,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 
@@ -46,11 +46,43 @@ struct SessionEntry {
     /// Outbound frame sink to this session's writer task.
     outbound: Outbound,
     /// Fires when the session must be force-dropped (revocation / reaping, DESIGN.md §16).
-    kill: Arc<Notify>,
+    kill: Arc<Kill>,
     /// The channels this session is currently subscribed to.
     channels: HashSet<String>,
     /// Last inbound activity, for the heartbeat reaper (DESIGN.md §10).
     last_seen: Instant,
+}
+
+/// A session's force-drop signal, carrying *why* it fired so the termination frame self-describes
+/// (a superseded session must not read like an auth failure, PRD-0012 T-002).
+pub(crate) struct Kill {
+    notify: Notify,
+    reason: OnceLock<&'static str>,
+}
+
+impl Kill {
+    fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+            reason: OnceLock::new(),
+        }
+    }
+
+    /// Fires the kill, recording the reason (the first recorded reason wins).
+    pub(crate) fn fire(&self, reason: &'static str) {
+        let _ = self.reason.set(reason);
+        self.notify.notify_one();
+    }
+
+    /// Waits for the kill to fire.
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    /// The recorded reason, generic if none was set.
+    pub(crate) fn reason(&self) -> &'static str {
+        self.reason.get().copied().unwrap_or("session terminated")
+    }
 }
 
 /// The in-memory runtime state, guarded by a single mutex (short, await-free critical sections).
@@ -69,6 +101,9 @@ struct HubState {
 pub(crate) struct Hub {
     store: Store,
     admins: super::AdminAllowlist,
+    /// The store's persistent instance ID, stamped on every WS upgrade response so a bridge can
+    /// recognize the same server reached under two URLs (PRD-0012 T-003).
+    instance_id: String,
     state: Mutex<HubState>,
 }
 
@@ -85,9 +120,11 @@ impl Hub {
         for (channel, user) in store.list_bans().await? {
             bans.entry(channel).or_default().insert(user);
         }
+        let instance_id = store.instance_id().await?;
         Ok(Arc::new(Self {
             store,
             admins,
+            instance_id,
             state: Mutex::new(HubState { bans, ..HubState::default() }),
         }))
     }
@@ -99,6 +136,11 @@ impl Hub {
     /// Whether `user` is a server-wide admin (on the serve-config allowlist, DESIGN.md §7).
     pub(crate) fn is_admin(&self, user: &str) -> bool {
         self.admins.contains_key(user)
+    }
+
+    /// The server's persistent instance ID (see the `instance_id` field).
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// The machines enrolled under `user` (for `machine list`, DESIGN.md §5.1).
@@ -165,18 +207,18 @@ impl Hub {
 
     /// Registers a live session and returns its kill handle, superseding any prior session on the
     /// same path so a half-open reconnect takes over immediately (§5, #16).
-    pub(crate) fn attach(&self, path: &SessionPath, user: &str, machine: &str, outbound: Outbound) -> Arc<Notify> {
+    pub(crate) fn attach(&self, path: &SessionPath, user: &str, machine: &str, outbound: Outbound) -> Arc<Kill> {
         let mut st = self.state();
         // A fresh authenticated session for this path supersedes any prior one, so a reconnect after
         // an ungraceful (half-open) drop takes over immediately instead of waiting out the idle
         // reaper (#16). Possession is already proven at auth, so only the identity holder can take
         // over its own handle; a true duplicate (same handle, two live processes) is last-writer-wins.
         if let Some(existing) = st.sessions.get(path) {
-            existing.kill.notify_one();
+            existing.kill.fire("session superseded by a newer connection for the same session path");
             Self::take_session(&mut st, path);
         }
 
-        let kill = Arc::new(Notify::new());
+        let kill = Arc::new(Kill::new());
         st.sessions.insert(
             path.clone(),
             SessionEntry {
@@ -193,7 +235,7 @@ impl Hub {
 
     /// Removes a session's presence and subscriptions (on clean disconnect); idempotent. Guarded by
     /// session identity so a session that was superseded (#16) does not evict its replacement.
-    pub(crate) fn detach(&self, path: &SessionPath, kill: &Arc<Notify>) {
+    pub(crate) fn detach(&self, path: &SessionPath, kill: &Arc<Kill>) {
         let mut st = self.state();
         if st.sessions.get(path).is_some_and(|e| Arc::ptr_eq(&e.kill, kill)) {
             Self::take_session(&mut st, path);
@@ -219,7 +261,7 @@ impl Hub {
             .collect();
 
         for path in &stale {
-            Self::kill_locked(&mut st, path);
+            Self::kill_locked(&mut st, path, "idle timeout: no heartbeat");
         }
         stale.len()
     }
@@ -319,7 +361,7 @@ impl Hub {
 
     /// Fans a channel message out to every *other* subscribed session; the sender must be a member.
     pub(crate) fn post(&self, from: &SessionPath, channel: &str, payload: Payload) -> Result<(), ProtocolError> {
-        let targets: Vec<(Arc<Notify>, Outbound)> = {
+        let targets: Vec<(Arc<Kill>, Outbound)> = {
             let st = self.state();
             let subs = st.subscriptions.get(channel).ok_or_else(|| ProtocolError::from(AclError::NotMember(channel.to_owned())))?;
             if !subs.contains(from) {
@@ -340,7 +382,7 @@ impl Hub {
             // A full (slow consumer) or closed queue: force-drop it rather than grow memory (#14);
             // a reconnect re-subscribes with fresh state.
             if tx.try_send(msg.clone()).is_err() {
-                kill.notify_one();
+                kill.fire("slow consumer: outbound queue overflowed");
             }
         }
         Ok(())
@@ -360,7 +402,7 @@ impl Hub {
         };
         // Force-drop a slow/closed consumer rather than grow its queue unbounded (#14).
         if outbound.try_send(msg).is_err() {
-            kill.notify_one();
+            kill.fire("slow consumer: outbound queue overflowed");
         }
         Ok(())
     }
@@ -658,7 +700,7 @@ impl Hub {
         let mut st = self.state();
         let paths: Vec<SessionPath> = st.sessions.iter().filter(|(_, e)| e.user == user).map(|(p, _)| p.clone()).collect();
         for path in &paths {
-            Self::kill_locked(&mut st, path);
+            Self::kill_locked(&mut st, path, "user removed from this server");
         }
     }
 
@@ -666,7 +708,7 @@ impl Hub {
         let mut st = self.state();
         let paths: Vec<SessionPath> = st.sessions.iter().filter(|(_, e)| e.user == user && e.machine == machine).map(|(p, _)| p.clone()).collect();
         for path in &paths {
-            Self::kill_locked(&mut st, path);
+            Self::kill_locked(&mut st, path, "machine key revoked");
         }
     }
 
@@ -706,9 +748,9 @@ impl Hub {
     }
 
     /// Force-drops a session: removes it and signals its driver to shut the transport (§16).
-    fn kill_locked(st: &mut HubState, path: &SessionPath) {
+    fn kill_locked(st: &mut HubState, path: &SessionPath, reason: &'static str) {
         if let Some(entry) = Self::take_session(st, path) {
-            entry.kill.notify_one();
+            entry.kill.fire(reason);
         }
     }
 

@@ -64,7 +64,7 @@ pub async fn serve(config: ServerConfig) -> Void {
 
     spawn_reaper(Arc::clone(&hub));
 
-    let app = Router::new().route("/", get(ws_handler)).route("/health", get(health)).with_state(hub);
+    let app = router(hub);
     let listener = TcpListener::bind(&config.bind).await.with_context(|| format!("failed to bind `{}`", config.bind))?;
     let addr = listener.local_addr().context("failed to read the bound address")?;
     tracing::info!(%addr, "conclave server listening");
@@ -93,13 +93,26 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Builds the server's router: the WS upgrade route plus the health endpoint.
+fn router(hub: Arc<Hub>) -> Router {
+    Router::new().route("/", get(ws_handler)).route("/health", get(health)).with_state(hub)
+}
+
 /// The WebSocket upgrade handler; every connection is dispatched to [`handle_ws`].
 async fn ws_handler(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> Response {
+    // The instance ID rides the upgrade response so a bridge can recognize the same server behind
+    // two URLs before it ever authenticates (PRD-0012 T-003).
+    let instance_id = axum::http::HeaderValue::from_str(hub.instance_id()).ok();
     // Enforce the protocol's frame cap (Constant::MAX_FRAME_SIZE) instead of tungstenite's 64 MiB
     // default, so a pre-auth peer cannot force a large buffer per message (finding #17/#19).
-    ws.max_message_size(Constant::MAX_FRAME_SIZE)
+    let mut response = ws
+        .max_message_size(Constant::MAX_FRAME_SIZE)
         .max_frame_size(Constant::MAX_FRAME_SIZE)
-        .on_upgrade(move |socket| handle_ws(hub, socket))
+        .on_upgrade(move |socket| handle_ws(hub, socket));
+    if let Some(id) = instance_id {
+        response.headers_mut().insert(Constant::SERVER_ID_HEADER, id);
+    }
+    response
 }
 
 /// Bridges a WebSocket to [`run_session`]: each WS binary message is one protocol frame.
@@ -169,4 +182,35 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 
     tracing::info!("shutdown signal received; draining connections");
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests relax `unwrap_used` (house convention; DESIGN.md §22).
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// The WS upgrade response carries the persistent instance ID so a bridge can recognize the
+    /// same server reached under two URLs (PRD-0012 T-003) — an HTTP header, out-of-band of the
+    /// wire protocol, so old peers simply never look at it.
+    #[tokio::test]
+    async fn wss_upgrade_response_carries_the_server_instance_id() {
+        let store = Store::open_in_memory().await.unwrap();
+        let expected = store.instance_id().await.unwrap();
+        let hub = Hub::new(store, super::super::AdminAllowlist::default()).await.unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router(hub)).await.unwrap();
+        });
+
+        // Stable across connections — two dials see the same ID.
+        for _ in 0..2 {
+            let (_ws, response) = tokio_tungstenite::connect_async(format!("ws://{addr}/")).await.unwrap();
+            let got = response.headers().get(Constant::SERVER_ID_HEADER).expect("the upgrade response must carry the instance-id header");
+            assert_eq!(got.to_str().unwrap(), expected);
+        }
+    }
 }

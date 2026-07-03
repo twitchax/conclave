@@ -18,5 +18,5 @@ network-heavy = { max-threads = 1 }
 # The `e2e_*` and `cli_*` tests spawn a real `conclave serve` (and bridges) on loopback ports;
 # serialize them so concurrent binds don't race for ports.
 [[profile.default.overrides]]
-filter = 'test(/e2e_(serve|channel|join_skill|multihome)/) or test(/cli_/)'
+filter = 'test(/e2e_(serve|channel|join_skill|multihome|bridge_disables)/) or test(/cli_/)'
 test-group = 'network-heavy'

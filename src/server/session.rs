@@ -12,7 +12,7 @@
 
 use std::{ops::ControlFlow, sync::Arc, time::Duration};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 
 /// How long an unauthenticated connection may take to complete the handshake before it is dropped,
 /// so a silent or stalled pre-auth peer cannot hold a connection (and its buffers) open forever —
@@ -25,7 +25,7 @@ use crate::{
     protocol::{ProtocolError, ProtocolMessage, negotiate_version},
 };
 
-use super::hub::Hub;
+use super::hub::{Hub, Kill};
 
 /// The inbound frame stream and outbound frame sink a session is driven over. The outbound
 /// (server→client) queue is bounded so a slow consumer cannot grow server memory without limit
@@ -44,7 +44,7 @@ pub(crate) const OUTBOUND_CAPACITY: usize = 1024;
 /// The authenticated identity of a live session (its resolved path plus its kill signal).
 struct SessionCtx {
     path: SessionPath,
-    kill: Arc<Notify>,
+    kill: Arc<Kill>,
 }
 
 /// Drives one authenticated session to completion over the given frame channels.
@@ -66,7 +66,9 @@ pub(crate) async fn run_session(hub: Arc<Hub>, mut inbound: Inbound, outbound: O
     loop {
         tokio::select! {
             () = kill.notified() => {
-                let _ = outbound.try_send(err(ProtocolError::Unauthorized("session terminated".to_owned())));
+                // The reason self-describes the drop (superseded / revoked / idle / slow consumer)
+                // so it does not read like an auth failure (PRD-0012 T-002).
+                let _ = outbound.try_send(err(ProtocolError::Unauthorized(kill.reason().to_owned())));
                 break;
             }
             frame = inbound.recv() => {

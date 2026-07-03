@@ -235,6 +235,11 @@ framing **and** the permission-relay (§12) — conclave does not control them d
   `(session, server)`. Outbound-only dialing means no inbound-NAT problem, and **cloudflared tunnels
   HTTP/WS trivially** (it does not expose arbitrary UDP/QUIC origins — a key reason TCP/WS beats
   QUIC here). The ping/pong keepalive doubles as the presence heartbeat (§10).
+- **Same-server detection:** the upgrade response carries `x-conclave-server-id` — a persistent
+  random instance ID — so a bridge recognizes one server reached under two URLs (fly.dev + custom
+  domain) and disables the duplicate link *pre-auth*; two links on the same session path would
+  otherwise supersede each other forever (PRD-0012). Riding the HTTP upgrade keeps it out-of-band
+  of the versioned wire frames: old peers never look at it.
 - **CC ↔ bridge:** local stdio (MCP) — a parent/child pipe, plaintext in v1 (see §12).
 
 ## 12. Threat model & trust
@@ -329,7 +334,9 @@ message history (none); **permission levels** (local bridge config, §9); **serv
 
 - Bridge **reconnects** to central on drop (backoff) and **re-subscribes** joined channels on
   reconnect; central marks the session offline on disconnect, and the **heartbeat reaper** catches
-  half-open connections (§10).
+  half-open connections (§10). The backoff resets only after a link stays up for a stability
+  window — a successful connect that is killed immediately (a supersede fight) keeps backing off
+  (PRD-0012).
 - **Bridge process death** (crash) loses in-memory join state — only connection-drops auto-resubscribe;
   a fresh process needs a re-`/join`.
 - Auth failure (unknown/revoked key, taken username, handle collision) → clear CLI/CC error.

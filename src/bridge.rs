@@ -75,6 +75,8 @@ pub async fn run(setup: BridgeSetup) -> Void {
     let sink = Box::new(McpSink::new(to_mcp_tx.clone()));
     let mut core = BridgeCore::new(setup.config.clone(), setup.session.clone(), to_mcp_tx, sink);
 
+    // Shared across links so two URLs reaching the same server dedupe at connect (PRD-0012 T-003).
+    let claims = client::ServerClaims::default();
     for registration in registrations {
         let joined = Arc::new(Mutex::new(HashSet::new()));
         let (out_tx, out_rx) = mpsc::unbounded_channel();
@@ -83,11 +85,13 @@ pub async fn run(setup: BridgeSetup) -> Void {
         let identity = Arc::clone(&identity);
         let url = registration.url.clone();
         let session = setup.session.clone();
+        let claims = Arc::clone(&claims);
         let connect = move || {
             let identity = Arc::clone(&identity);
             let url = url.clone();
             let session = session.clone();
-            async move { client::connect_ws(&url, &identity, &session).await }
+            let claims = Arc::clone(&claims);
+            async move { client::connect_ws(&url, &identity, &session, &claims).await }
         };
         tokio::spawn(client::run_link(registration.url.clone(), connect, inbound_tx.clone(), out_rx, Arc::clone(&shutdown)));
         spawn_keepalive(out_tx, Arc::clone(&shutdown));
@@ -202,6 +206,7 @@ impl BridgeCore {
         match event {
             client::LinkEvent::Up => self.link_up(server),
             client::LinkEvent::Down => self.link_down(server),
+            client::LinkEvent::Duplicate { canonical } => self.link_duplicate(server, &canonical),
             client::LinkEvent::Frame(frame) => self.handle_inbound(server, frame),
         }
     }
@@ -661,6 +666,28 @@ impl BridgeCore {
         if self.link_down_notified.insert(server.to_owned()) {
             self.notify(server, "link", &format!("Disconnected from `{server}` — reconnecting."));
         }
+    }
+
+    /// A startup dedupe hit (PRD-0012 T-003): `server` reaches the same physical server as
+    /// `canonical`, and its link has permanently shut down — two links to one server would
+    /// supersede each other's session forever. Fails anything queued at the dead link, then
+    /// forgets it so tools error with the canonical URL instead of hanging.
+    fn link_duplicate(&mut self, server: &str, canonical: &str) {
+        if let Some(queue) = self.pending.remove(server) {
+            for entry in queue {
+                if let Pending::Tool { id, .. } = entry {
+                    self.send_mcp(mcp::tool_error_result(&id, &format!("`{server}` is the same server as `{canonical}`; target `{canonical}` instead")));
+                }
+            }
+        }
+        self.servers.remove(server);
+        self.admin_servers.remove(server);
+        self.link_down_notified.remove(server);
+        self.notify(
+            server,
+            "link",
+            &format!("`{server}` is the same server as `{canonical}` — this duplicate link is disabled; target `{canonical}` instead."),
+        );
     }
 
     // -----------------------------------------------------------------------

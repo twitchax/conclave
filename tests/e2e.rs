@@ -18,7 +18,7 @@ use std::{
 
 use conclavelib::{
     base::{Constant, PermissionLevel, SessionPath, Visibility},
-    identity::{Config, Identity, ServerRegistration, save_config, save_identity},
+    identity::{Config, Identity, PermissionOverride, ServerRegistration, save_config, save_identity},
     protocol::{AdminOp, Payload, ProtocolMessage, decode, encode},
 };
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -849,4 +849,117 @@ async fn e2e_multihome_routes_to_the_correct_server_and_target() {
         ProtocolMessage::Whisper { payload, .. } => assert_eq!(payload, Payload::Plain("psst A".to_owned())),
         other => panic!("david expected a whisper, got {other:?}"),
     }
+}
+
+#[test]
+fn cli_server_list_and_remove_manage_local_registrations() {
+    let dir = TempDir::new().unwrap();
+    let id = Identity::generate().unwrap();
+    save_identity(dir.path(), &id).unwrap();
+    save_config(
+        dir.path(),
+        &Config {
+            default_permission: PermissionLevel::Notify,
+            servers: vec![
+                ServerRegistration {
+                    url: "wss://a.example".to_owned(),
+                    username: "aaron".to_owned(),
+                    machine: "workstation".to_owned(),
+                },
+                ServerRegistration {
+                    url: "wss://b.example".to_owned(),
+                    username: "aaron".to_owned(),
+                    machine: "workstation".to_owned(),
+                },
+            ],
+            overrides: vec![
+                PermissionOverride {
+                    server: "wss://a.example".to_owned(),
+                    channel: None,
+                    level: PermissionLevel::Converse,
+                },
+                PermissionOverride {
+                    server: "wss://b.example".to_owned(),
+                    channel: Some("ops".to_owned()),
+                    level: PermissionLevel::Converse,
+                },
+            ],
+        },
+    )
+    .unwrap();
+
+    // `server list` shows every registration.
+    let list = run_cli(dir.path(), &["server", "list"]);
+    assert!(list.status.success());
+    let out = stdout_of(&list);
+    assert!(out.contains("wss://a.example") && out.contains("wss://b.example"), "both registrations must be listed: {out}");
+
+    // `server remove` forgets the registration AND its permission overrides (local only) — the
+    // stranded double-registration behind the live supersede storm had no CLI exit (PRD-0012 T-004).
+    let removed = run_cli(dir.path(), &["server", "remove", "wss://b.example"]);
+    assert!(removed.status.success(), "remove must succeed: {}", stdout_of(&removed));
+
+    let out = stdout_of(&run_cli(dir.path(), &["server", "list"]));
+    assert!(out.contains("wss://a.example") && !out.contains("wss://b.example"), "the removed server must be gone: {out}");
+    let perms = stdout_of(&run_cli(dir.path(), &["perm", "show"]));
+    assert!(!perms.contains("wss://b.example"), "removing a server must drop its permission overrides: {perms}");
+    assert!(perms.contains("wss://a.example"), "other servers' overrides must survive: {perms}");
+
+    // Removing an unknown server fails loudly rather than silently succeeding.
+    assert!(!run_cli(dir.path(), &["server", "remove", "wss://nope.example"]).status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_bridge_disables_a_duplicate_url_for_the_same_server() {
+    // ONE server reachable under two URLs — the fly.dev + custom-domain shape behind the live
+    // supersede storm (PRD-0012 T-003). The query string names a distinct "server" to the bridge
+    // while routing to the same listener.
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let dup_url = format!("ws://{addr}/?via=alias");
+    let server_dir = TempDir::new().unwrap();
+    let _server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+
+    let dir = TempDir::new().unwrap();
+    let id = Identity::generate().unwrap();
+    save_identity(dir.path(), &id).unwrap();
+    save_config(
+        dir.path(),
+        &Config {
+            default_permission: PermissionLevel::Converse,
+            servers: vec![
+                ServerRegistration {
+                    url: url.clone(),
+                    username: "aaron".to_owned(),
+                    machine: "workstation".to_owned(),
+                },
+                ServerRegistration {
+                    url: dup_url.clone(),
+                    username: "aaron".to_owned(),
+                    machine: "workstation".to_owned(),
+                },
+            ],
+            overrides: vec![],
+        },
+    )
+    .unwrap();
+    {
+        let mut ws = ws_connect(addr).await;
+        ws_register(&mut ws, &id, "aaron", "workstation", "setup").await;
+    }
+
+    let mut bridge = Bridge::spawn_all(dir.path(), "sess");
+    bridge.initialize().await;
+
+    // Exactly one link claims the server; the other is told, once, that it is a duplicate.
+    let notice = bridge.read_injection("is the same server as").await;
+    let content = notice.pointer("/params/content").and_then(Value::as_str).unwrap();
+    assert!(content.contains("disabled"), "the duplicate-link notice must say the link is disabled: {content}");
+
+    // Presence settles at exactly one session — no supersede fight. `who` needs no server
+    // argument: the duplicate link was forgotten, so exactly one connection remains.
+    let who = bridge.call(1, "who", json!({})).await;
+    let text = who.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
+    assert_eq!(text.matches("aaron/workstation/sess").count(), 1, "exactly one live session expected: {text}");
 }
