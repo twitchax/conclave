@@ -427,7 +427,12 @@ impl Hub {
                 self.force_drop_machine(user, &name);
                 Ok(ack(name))
             }
-            // Self-service enrollment of a new machine key; it proves possession on first connect.
+            // Self-service enrollment: adds a machine key to the *caller's own* account (`user`) —
+            // never another user's, so there is no cross-account key-planting path (#8). The key
+            // confers no access until its holder proves possession at first-connect auth (the
+            // challenge signature is verified against this pubkey), so enrolling a key one does not
+            // hold grants nothing. Enrollment-time proof would add no security here: a party able to
+            // enroll their own key can equally sign an enrollment challenge with it.
             AdminOp::MachineAdd { name, pubkey } => {
                 let pubkey_b64 = identity::encode_key(&pubkey);
                 self.store.create_machine(user, &name, &pubkey_b64).await.map_err(internal)?;

@@ -265,6 +265,37 @@ async fn server_auth_refuses_bad_signature() {
     assert!(is_unauthorized(&response), "a bad signature must be refused, got {response:?}");
 }
 
+// A self-enrolled machine key (AdminOp::MachineAdd) grants access only to whoever holds its private
+// key: possession is proven at first-connect auth, so enrolling a key confers nothing on its own
+// (PRD-0007 T-001, #8).
+#[tokio::test]
+async fn server_machine_add_key_still_proves_possession_at_auth() {
+    let hub = hub().await;
+    let workstation = Identity::generate().unwrap();
+    let laptop = Identity::generate().unwrap();
+    let impostor = Identity::generate().unwrap();
+
+    // aaron registers workstation, then self-enrolls the laptop's public key on his own account.
+    let mut aaron = Client::connect(&hub);
+    established_path(aaron.register(&workstation, "aaron", "workstation", "razel").await);
+    let ack = aaron
+        .admin(AdminOp::MachineAdd {
+            name: "laptop".to_owned(),
+            pubkey: laptop.public_key().to_vec(),
+        })
+        .await;
+    assert!(matches!(ack, ProtocolMessage::Ack { .. }), "machine add should be acked, got {ack:?}");
+
+    // The enrolled key authenticates as aaron/laptop — possession proven by the challenge signature.
+    let mut good = Client::connect(&hub);
+    let path = established_path(good.authenticate(&laptop, "onthego").await);
+    assert_eq!(path, SessionPath::new("aaron", "laptop", "onthego"));
+
+    // An impostor key that was never enrolled is refused — enrollment alone grants nothing.
+    let mut evil = Client::connect(&hub);
+    assert!(is_unauthorized(&evil.authenticate(&impostor, "onthego").await), "an unenrolled key must not authenticate",);
+}
+
 #[tokio::test]
 async fn server_auth_refuses_revoked_key() {
     let hub = hub().await;
