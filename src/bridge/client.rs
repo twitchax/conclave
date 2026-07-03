@@ -30,7 +30,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A link must stay up this long before a drop resets the backoff. An instantly-killed connect
 /// (a supersede fight between two links holding the same session path, PRD-0012 T-001) counts as
 /// a failure, not a success — reset-on-connect is what let that fight loop at the base delay.
-const STABLE_UPTIME: Duration = Duration::from_secs(30);
+/// Shared with the orchestrator's notice policy (PRD-0015 T-002): the same window decides when a
+/// flapping link has "stabilized".
+pub(crate) const STABLE_UPTIME: Duration = Duration::from_secs(30);
 
 /// Frames in / frames out for one authenticated server link (post-handshake).
 pub(crate) struct LinkIo {

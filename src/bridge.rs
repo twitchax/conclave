@@ -42,6 +42,11 @@ use sink::{Injection, NotificationSink};
 /// reaper, DESIGN.md §10).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
+/// Consecutive sub-[`client::STABLE_UPTIME`] links before the orchestrator diagnoses a probable
+/// handle conflict (another live session superseding this one) and stops streaming link notices
+/// (PRD-0015 T-002).
+const RAPID_DROP_DIAGNOSIS_THRESHOLD: u32 = 3;
+
 /// Everything the running bridge needs: this machine's key, the local config, the session handle,
 /// and (optionally) a subset of configured servers to connect to.
 pub struct BridgeSetup {
@@ -161,6 +166,11 @@ struct BridgeCore {
     link_down_notified: HashSet<String>,
     /// Servers on which the authenticated user is an admin (from `ServerInfo`) — gates admin tools.
     admin_servers: HashSet<String>,
+    /// When each server's link last came up, for the flapping diagnosis (PRD-0015 T-002).
+    link_up_at: HashMap<String, tokio::time::Instant>,
+    /// Consecutive short-lived links per server; at the threshold the conflict diagnostic fires
+    /// and link notices go quiet until a link stabilizes.
+    rapid_drops: HashMap<String, u32>,
 }
 
 impl BridgeCore {
@@ -174,6 +184,8 @@ impl BridgeCore {
             pending: HashMap::new(),
             link_down_notified: HashSet::new(),
             admin_servers: HashSet::new(),
+            link_up_at: HashMap::new(),
+            rapid_drops: HashMap::new(),
         }
     }
 
@@ -201,13 +213,30 @@ impl BridgeCore {
         Ok(())
     }
 
-    /// Routes a link event: lifecycle (re-subscribe on `Up`, fail pending on `Down`) or a frame.
+    /// Routes a link event, then re-lists tools if the event changed the gating (PRD-0015 T-001).
     fn handle_link_event(&mut self, server: &str, event: client::LinkEvent) {
+        let before = self.tool_signature();
         match event {
             client::LinkEvent::Up => self.link_up(server),
             client::LinkEvent::Down => self.link_down(server),
             client::LinkEvent::Duplicate { canonical } => self.link_duplicate(server, &canonical),
             client::LinkEvent::Frame(frame) => self.handle_inbound(server, frame),
+        }
+        self.notify_tools_changed(before);
+    }
+
+    /// The gating inputs that decide which tools [`Self::tools`] offers. Checked around each
+    /// dispatched event: any change means the client's cached `tools/list` is stale.
+    fn tool_signature(&self) -> (bool, bool) {
+        (self.any_emit_allowed(), self.admin_servers.is_empty())
+    }
+
+    /// Emits `tools/list_changed` if the toolset gating moved across a dispatched event — Claude
+    /// Code caches the tool list, so without this a newly-allowed `send_channel` (or the admin
+    /// tools arriving with `ServerInfo`) would never surface mid-session (PRD-0015 T-001).
+    fn notify_tools_changed(&mut self, before: (bool, bool)) {
+        if self.tool_signature() != before {
+            self.send_mcp(mcp::tools_list_changed());
         }
     }
 
@@ -215,7 +244,14 @@ impl BridgeCore {
     // MCP → bridge.
     // -----------------------------------------------------------------------
 
+    /// Routes an MCP event, then re-lists tools if the event changed the gating (PRD-0015 T-001).
     fn handle_mcp(&mut self, event: FromMcp) {
+        let before = self.tool_signature();
+        self.dispatch_mcp(event);
+        self.notify_tools_changed(before);
+    }
+
+    fn dispatch_mcp(&mut self, event: FromMcp) {
         match event {
             FromMcp::Initialize { id, protocol_version } => self.send_mcp(mcp::initialize_result(&id, &protocol_version)),
             FromMcp::ListTools { id } => {
@@ -641,6 +677,7 @@ impl BridgeCore {
     /// re-subscribe every joined channel, enqueuing a silent `Resubscribe` per `Join` so its
     /// `Joined` ack never resolves an unrelated tool call (PRD-0008 T-001/T-003).
     fn link_up(&mut self, server: &str) {
+        self.link_up_at.insert(server.to_owned(), tokio::time::Instant::now());
         if self.link_down_notified.remove(server) {
             self.notify(server, "link", &format!("Reconnected to `{server}`."));
         }
@@ -663,6 +700,35 @@ impl BridgeCore {
                 }
             }
         }
+
+        // Notice policy (PRD-0015 T-002): a run of instant drops is almost always another live
+        // session superseding this handle — diagnose it once, then go quiet until the link
+        // stabilizes, instead of streaming Disconnected/Reconnected pairs forever.
+        let stable = self.link_up_at.remove(server).is_none_or(|up| up.elapsed() >= client::STABLE_UPTIME);
+        if stable {
+            self.rapid_drops.remove(server);
+        } else {
+            let drops = {
+                let count = self.rapid_drops.entry(server.to_owned()).or_insert(0);
+                *count += 1;
+                *count
+            };
+            if drops == RAPID_DROP_DIAGNOSIS_THRESHOLD {
+                self.notify(
+                    server,
+                    "link",
+                    &format!(
+                        "The link to `{server}` keeps dropping right after connecting — if another live session is using the handle `{session}`, the two supersede each other; start one with a distinct `--as`. Going quiet until the link stabilizes.",
+                        session = self.session
+                    ),
+                );
+                return;
+            }
+            if drops > RAPID_DROP_DIAGNOSIS_THRESHOLD {
+                return;
+            }
+        }
+
         if self.link_down_notified.insert(server.to_owned()) {
             self.notify(server, "link", &format!("Disconnected from `{server}` — reconnecting."));
         }

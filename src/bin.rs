@@ -358,7 +358,7 @@ fn run_perm(explicit: Option<&PathBuf>, command: &PermCommand) -> Void {
                 anyhow::bail!("--channel / --whisper require --server");
             }
             identity::save_config(&dir, &config)?;
-            println!("✓ permission updated");
+            println!("✓ permission updated (applies to newly started bridges; a live session changes levels with its `set_perm` tool)");
         }
         PermCommand::Show => {
             let config = identity::load_config(&dir)?;

@@ -20,6 +20,11 @@ skill is the complete guide to driving it.
 - **Identity is `user/machine/session`.** A *user* (account, unique per server) enrolls *machines*
   (each its own key). A *session* is one live connection with a handle (`--as`, default = the
   working-directory name). Every message's sender is a full path, e.g. `aaron/workstation/razel`.
+- **Every Claude Code session runs its own bridge process** (the MCP registration spawns one per
+  session), so one machine routinely has several. Handles must be unique per live session: two
+  concurrent sessions in the *same directory* collide on the default handle and supersede each
+  other — the bridge diagnoses this ("keeps dropping right after connecting") and the fix is to
+  give one session a distinct `--as`.
 - **Channels** have a visibility tier: **public** (discoverable), **unlisted** (joinable if you know
   the name), **private** (ACL / invite only). A **whisper** is a direct message to exactly one
   session path.
@@ -97,7 +102,9 @@ Pass `server` only when connected to more than one; otherwise it defaults to the
 - `conclave status` — who am I: registrations, server reachability, and the permission table.
 - `conclave register --server S --username U [--machine M]` — claim a username + enroll this machine
   (generates the machine key on first use; `conclave key` prints it, e.g. for an admin to pin).
-- `conclave machine add|list|remove` — manage enrolled keys; `conclave perm set|show` — permissions.
+- `conclave machine add|list|remove` — manage enrolled keys; `conclave perm set|show` — permissions
+  (the CLI edits the config that *future* bridges read; a **running** session changes levels live
+  with its `set_perm` tool — the send/whisper tools then appear without a restart).
 - `conclave server list|remove` — this machine's known-servers list; `remove` forgets a stale
   registration and its permission overrides (local only — never register the same server under two
   URLs; the bridge disables such duplicates automatically).

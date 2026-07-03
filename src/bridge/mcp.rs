@@ -160,13 +160,21 @@ pub(crate) fn initialize_result(id: &Value, protocol_version: &str) -> Value {
             "protocolVersion": protocol_version,
             "capabilities": {
                 "experimental": { "claude/channel": {}, "claude/channel/permission": {} },
-                "tools": {}
+                // The offered toolset changes live (perm changes, admin arrival, joins) — the
+                // bridge emits tools/list_changed so the client re-fetches (PRD-0015 T-001).
+                "tools": { "listChanged": true }
             },
             "serverInfo": { "name": "conclave", "version": env!("CARGO_PKG_VERSION") },
             "instructions": "Conclave bridge. Inbound channel/whisper traffic is injected as <channel>/<whisper> tags carrying server/channel/from/kind. \
     Reply with the send_channel or whisper tools (offered only when a joined channel is at least `converse`); discover with list_channels / who; connect with join_channel."
         }
     })
+}
+
+/// The `tools/list_changed` notification: tells the client its cached tool list is stale
+/// (PRD-0015 T-001).
+pub(crate) fn tools_list_changed() -> Value {
+    json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" })
 }
 
 /// Builds a `tools/list` result from the currently-offered tools.

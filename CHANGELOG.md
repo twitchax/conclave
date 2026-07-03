@@ -16,6 +16,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file 
 
 ### Fixed
 
+- **The tool list is now live (PRD-0015).** The bridge declares `tools.listChanged` and emits
+  `notifications/tools/list_changed` whenever gating changes (a `set_perm` to `converse`, admin
+  status arriving, joins) — previously Claude Code's cached tool list meant `send_channel` could
+  *never* appear mid-session, no matter how permissions changed.
+- **Handle conflicts self-diagnose (PRD-0015).** Two live sessions sharing one handle (e.g. two
+  Claude Code sessions in the same directory using the default) supersede each other; the bridge
+  now names the cause and remedy (`--as`) after three instant drops and quiets the link notices
+  until the connection stabilizes. `conclave perm set` also states that live sessions use the
+  `set_perm` tool.
 - **Same-server supersede storm (PRD-0012).** A machine registered on one server under two URLs
   (e.g. fly.dev + custom domain) running a bare `conclave bridge` had its two links evict each
   other's session in a hot loop. Three-part fix: the server now stamps a persistent instance ID on

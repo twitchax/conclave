@@ -14,7 +14,7 @@ use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use super::{BridgeCore, mcp::FromMcp, mcp::McpSink};
+use super::{BridgeCore, client, mcp::FromMcp, mcp::McpSink};
 use crate::{
     base::{PermissionLevel, SessionPath, Visibility},
     identity::{Config, PermissionOverride, ServerRegistration},
@@ -523,4 +523,125 @@ fn bridge_admin_tool_is_scoped_to_a_server_that_asserted_admin() {
         matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Admin(_)),
         "an admin op on a server that asserted admin is forwarded",
     );
+}
+
+// -----------------------------------------------------------------------------
+// PRD-0015 T-001 — dynamic tool list (notifications/tools/list_changed).
+// -----------------------------------------------------------------------------
+
+/// Drains queued MCP messages, counting `tools/list_changed` notifications.
+fn drain_list_changed(rx: &mut mpsc::UnboundedReceiver<Value>) -> usize {
+    let mut count = 0;
+    while let Ok(msg) = rx.try_recv() {
+        if msg.get("method") == Some(&json!("notifications/tools/list_changed")) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Drains queued MCP messages, returning channel-notification texts.
+fn drain_notice_texts(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<String> {
+    let mut texts = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if msg.get("method") == Some(&json!("notifications/claude/channel"))
+            && let Some(content) = msg.pointer("/params/content").and_then(Value::as_str)
+        {
+            texts.push(content.to_owned());
+        }
+    }
+    texts
+}
+
+#[test]
+fn bridge_initialize_declares_tools_list_changed_capability() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    harness.core.handle_mcp(FromMcp::Initialize {
+        id: json!(0),
+        protocol_version: "2025-06-18".to_owned(),
+    });
+
+    let reply = harness.to_mcp_rx.try_recv().unwrap();
+    assert_eq!(
+        reply.pointer("/result/capabilities/tools/listChanged"),
+        Some(&json!(true)),
+        "the client only honors list_changed if the capability is declared: {reply}"
+    );
+}
+
+#[test]
+fn bridge_tools_list_changed_fires_when_set_perm_enables_emit() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    harness.joined.lock().unwrap().insert("ops".to_owned());
+
+    // Gating flips: a joined channel goes notify → converse, so send/whisper must appear — and
+    // Claude Code caches tools/list, so it must be told to re-fetch (found live: send_channel
+    // could never appear mid-session, PRD-0015 T-001).
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(1),
+        name: "set_perm".to_owned(),
+        args: json!({ "channel": "ops", "level": "converse" }),
+    });
+    assert_eq!(drain_list_changed(&mut harness.to_mcp_rx), 1, "the client must be told to re-fetch tools/list");
+
+    // Idempotent: re-setting the same level changes no gating, so no re-notify.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(2),
+        name: "set_perm".to_owned(),
+        args: json!({ "channel": "ops", "level": "converse" }),
+    });
+    assert_eq!(drain_list_changed(&mut harness.to_mcp_rx), 0, "an unchanged toolset must not re-notify");
+}
+
+#[test]
+fn bridge_tools_list_changed_fires_when_admin_status_arrives() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    harness.core.handle_link_event("s1", client::LinkEvent::Frame(ProtocolMessage::ServerInfo { admin: true }));
+    assert_eq!(drain_list_changed(&mut harness.to_mcp_rx), 1, "admin arrival exposes the admin tools");
+
+    // An ordinary frame that changes no gating must not re-notify.
+    harness.core.handle_link_event("s1", client::LinkEvent::Frame(channel_msg("ops", "hi")));
+    assert_eq!(drain_list_changed(&mut harness.to_mcp_rx), 0);
+}
+
+// -----------------------------------------------------------------------------
+// PRD-0015 T-002 — handle-conflict circuit breaker.
+// -----------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn bridge_link_flapping_diagnoses_a_handle_conflict_and_quiets_down() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    // The first two instant drops keep the normal notices…
+    for _ in 0..2 {
+        harness.core.handle_link_event("s1", client::LinkEvent::Up);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        harness.core.handle_link_event("s1", client::LinkEvent::Down);
+    }
+    let texts = drain_notice_texts(&mut harness.to_mcp_rx);
+    assert!(texts.iter().any(|t| t.contains("Disconnected")), "early drops keep the normal notice: {texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("--as")), "no diagnosis before the threshold: {texts:?}");
+
+    // …the third diagnoses the likely handle conflict, once, with the remedy…
+    harness.core.handle_link_event("s1", client::LinkEvent::Up);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    harness.core.handle_link_event("s1", client::LinkEvent::Down);
+    let texts = drain_notice_texts(&mut harness.to_mcp_rx);
+    assert!(texts.iter().any(|t| t.contains("--as")), "the third instant drop must diagnose the handle conflict: {texts:?}");
+
+    // …further flapping is quiet…
+    for _ in 0..3 {
+        harness.core.handle_link_event("s1", client::LinkEvent::Up);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        harness.core.handle_link_event("s1", client::LinkEvent::Down);
+    }
+    assert!(drain_notice_texts(&mut harness.to_mcp_rx).is_empty(), "flapping past the threshold must not stream notices");
+
+    // …until a link survives the stability window: the breaker resets, notices resume.
+    harness.core.handle_link_event("s1", client::LinkEvent::Up);
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    harness.core.handle_link_event("s1", client::LinkEvent::Down);
+    let texts = drain_notice_texts(&mut harness.to_mcp_rx);
+    assert!(texts.iter().any(|t| t.contains("Disconnected")), "a stable link resets the breaker: {texts:?}");
 }
