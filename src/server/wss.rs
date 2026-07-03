@@ -108,7 +108,7 @@ async fn handle_ws(hub: Arc<Hub>, socket: WebSocket) {
 
     let (mut sink, mut stream) = socket.split();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(super::session::OUTBOUND_CAPACITY);
 
     let read_task = tokio::spawn(async move {
         while let Some(Ok(message)) = stream.next().await {

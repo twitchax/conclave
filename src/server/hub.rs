@@ -31,7 +31,7 @@ use super::AclError;
 
 /// The outbound half of a live session: the router pushes frames here and the session's writer
 /// task drains them to the transport.
-type Outbound = mpsc::UnboundedSender<ProtocolMessage>;
+type Outbound = mpsc::Sender<ProtocolMessage>;
 
 /// A hub method's result: the response frame to return to the caller, or the wire error to surface.
 type Reply = Result<ProtocolMessage, ProtocolError>;
@@ -292,13 +292,16 @@ impl Hub {
 
     /// Fans a channel message out to every *other* subscribed session; the sender must be a member.
     pub(crate) fn post(&self, from: &SessionPath, channel: &str, payload: Payload) -> Result<(), ProtocolError> {
-        let targets: Vec<Outbound> = {
+        let targets: Vec<(Arc<Notify>, Outbound)> = {
             let st = self.state();
             let subs = st.subscriptions.get(channel).ok_or_else(|| ProtocolError::from(AclError::NotMember(channel.to_owned())))?;
             if !subs.contains(from) {
                 return Err(AclError::NotMember(channel.to_owned()).into());
             }
-            subs.iter().filter(|p| *p != from).filter_map(|p| st.sessions.get(p).map(|e| e.outbound.clone())).collect()
+            subs.iter()
+                .filter(|p| *p != from)
+                .filter_map(|p| st.sessions.get(p).map(|e| (Arc::clone(&e.kill), e.outbound.clone())))
+                .collect()
         };
 
         let msg = ProtocolMessage::ChannelMsg {
@@ -306,16 +309,20 @@ impl Hub {
             from: from.clone(),
             payload,
         };
-        for tx in targets {
-            let _ = tx.send(msg.clone());
+        for (kill, tx) in targets {
+            // A full (slow consumer) or closed queue: force-drop it rather than grow memory (#14);
+            // a reconnect re-subscribes with fresh state.
+            if tx.try_send(msg.clone()).is_err() {
+                kill.notify_one();
+            }
         }
         Ok(())
     }
 
     /// Delivers a whisper to exactly one live session path, erroring if it is not online (§8).
     pub(crate) fn whisper(&self, from: &SessionPath, target: &SessionPath, payload: Payload) -> Result<(), ProtocolError> {
-        let outbound = self.state().sessions.get(target).map(|e| e.outbound.clone());
-        let Some(outbound) = outbound else {
+        let target_entry = self.state().sessions.get(target).map(|e| (Arc::clone(&e.kill), e.outbound.clone()));
+        let Some((kill, outbound)) = target_entry else {
             return Err(ProtocolError::NotFound(format!("session `{target}` is not online")));
         };
 
@@ -324,7 +331,10 @@ impl Hub {
             target: target.clone(),
             payload,
         };
-        let _ = outbound.send(msg);
+        // Force-drop a slow/closed consumer rather than grow its queue unbounded (#14).
+        if outbound.try_send(msg).is_err() {
+            kill.notify_one();
+        }
         Ok(())
     }
 
@@ -675,9 +685,35 @@ mod tests {
     fn attach_session(hub: &Arc<Hub>, user: &str) -> SessionPath {
         let path = SessionPath::new(user, "machine", "session");
         // The outbound receiver is unused (these tests don't fan out); attach only needs the sender.
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(super::super::session::OUTBOUND_CAPACITY);
         hub.attach(&path, user, "machine", tx).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn fanout_drops_a_slow_consumer_instead_of_growing_its_queue() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.create_channel("ops", Visibility::Public, "aaron").await.unwrap();
+        let hub = Hub::new(store, HashMap::new());
+
+        // aaron posts; bob is a slow consumer with a tiny, never-drained outbound queue.
+        let aaron = attach_session(&hub, "aaron");
+        hub.join("aaron", &aaron, "ops", None).await.unwrap();
+
+        let bob = SessionPath::new("bob", "machine", "session");
+        let (b_tx, _b_rx) = mpsc::channel(1);
+        let b_kill = hub.attach(&bob, "bob", "machine", b_tx).unwrap();
+        hub.join("bob", &bob, "ops", None).await.unwrap();
+
+        // Fill bob's 1-slot queue, then overflow it — the second post cannot enqueue.
+        hub.post(&aaron, "ops", Payload::Plain("one".to_owned())).unwrap();
+        hub.post(&aaron, "ops", Payload::Plain("two".to_owned())).unwrap();
+
+        // The slow consumer is force-dropped (its kill fires) rather than buffering without bound.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), b_kill.notified()).await.is_ok(),
+            "a consumer that fills its bounded queue must be force-dropped",
+        );
     }
 
     #[tokio::test]

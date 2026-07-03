@@ -27,9 +27,19 @@ use crate::{
 
 use super::hub::Hub;
 
-/// The inbound frame stream and outbound frame sink a session is driven over.
+/// The inbound frame stream and outbound frame sink a session is driven over. The outbound
+/// (server→client) queue is bounded so a slow consumer cannot grow server memory without limit
+/// (PRD-0007 T-008, #14); one that fills it is force-dropped rather than backpressuring the fan-out.
 type Inbound = mpsc::UnboundedReceiver<ProtocolMessage>;
-type Outbound = mpsc::UnboundedSender<ProtocolMessage>;
+type Outbound = mpsc::Sender<ProtocolMessage>;
+// Only the byte-stream pump adapters (test transport) name the raw endpoints.
+#[cfg(test)]
+type InboundTx = mpsc::UnboundedSender<ProtocolMessage>;
+#[cfg(test)]
+type OutboundRx = mpsc::Receiver<ProtocolMessage>;
+
+/// Bound on a session's outbound queue; a fuller queue means the consumer is hopelessly behind (#14).
+pub(crate) const OUTBOUND_CAPACITY: usize = 1024;
 
 /// The authenticated identity of a live session (its resolved path plus its kill signal).
 struct SessionCtx {
@@ -47,7 +57,7 @@ pub(crate) async fn run_session(hub: Arc<Hub>, mut inbound: Inbound, outbound: O
         Ok(None) => return,
         // A silent / stalled pre-auth peer: drop it (finding #15).
         Err(_elapsed) => {
-            let _ = outbound.send(err(ProtocolError::Unauthorized("handshake timed out".to_owned())));
+            let _ = outbound.try_send(err(ProtocolError::Unauthorized("handshake timed out".to_owned())));
             return;
         }
     };
@@ -56,7 +66,7 @@ pub(crate) async fn run_session(hub: Arc<Hub>, mut inbound: Inbound, outbound: O
     loop {
         tokio::select! {
             () = kill.notified() => {
-                let _ = outbound.send(err(ProtocolError::Unauthorized("session terminated".to_owned())));
+                let _ = outbound.try_send(err(ProtocolError::Unauthorized("session terminated".to_owned())));
                 break;
             }
             frame = inbound.recv() => {
@@ -83,7 +93,7 @@ where
 {
     let (reader, writer) = tokio::io::split(stream);
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+    let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
 
     let read_task = tokio::spawn(read_pump(reader, inbound_tx));
     let write_task = tokio::spawn(write_pump(writer, outbound_rx));
@@ -99,7 +109,7 @@ where
 
 /// Reads length-delimited frames off the transport into the inbound channel until EOF / error.
 #[cfg(test)]
-async fn read_pump<R: tokio::io::AsyncRead + Unpin>(mut reader: R, inbound: Outbound) {
+async fn read_pump<R: tokio::io::AsyncRead + Unpin>(mut reader: R, inbound: InboundTx) {
     use crate::protocol::ProtocolRead as _;
     while let Ok(frame) = reader.recv_message().await {
         if inbound.send(frame).is_err() {
@@ -110,7 +120,7 @@ async fn read_pump<R: tokio::io::AsyncRead + Unpin>(mut reader: R, inbound: Outb
 
 /// Writes outbound frames to the transport as length-delimited frames until the channel closes.
 #[cfg(test)]
-async fn write_pump<W: tokio::io::AsyncWrite + Unpin>(mut writer: W, mut outbound: Inbound) {
+async fn write_pump<W: tokio::io::AsyncWrite + Unpin>(mut writer: W, mut outbound: OutboundRx) {
     use crate::protocol::ProtocolWrite as _;
     while let Some(frame) = outbound.recv().await {
         if writer.send_message(&frame).await.is_err() {
@@ -122,22 +132,22 @@ async fn write_pump<W: tokio::io::AsyncWrite + Unpin>(mut writer: W, mut outboun
 /// Runs the connect handshake, returning the authenticated context or `None` (error already sent).
 async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -> Option<SessionCtx> {
     let ProtocolMessage::Hello { protocol_version, session } = inbound.recv().await? else {
-        let _ = outbound.send(err(ProtocolError::MalformedFrame("expected Hello".to_owned())));
+        let _ = outbound.try_send(err(ProtocolError::MalformedFrame("expected Hello".to_owned())));
         return None;
     };
     if let Err(mismatch) = negotiate_version(protocol_version) {
-        let _ = outbound.send(err(mismatch));
+        let _ = outbound.try_send(err(mismatch));
         return None;
     }
 
     let nonce = match identity::generate_challenge() {
         Ok(nonce) => nonce,
         Err(e) => {
-            let _ = outbound.send(err(ProtocolError::Internal(e.to_string())));
+            let _ = outbound.try_send(err(ProtocolError::Internal(e.to_string())));
             return None;
         }
     };
-    let _ = outbound.send(ProtocolMessage::Challenge { nonce: nonce.to_vec() });
+    let _ = outbound.try_send(ProtocolMessage::Challenge { nonce: nonce.to_vec() });
 
     let (user, machine) = match inbound.recv().await? {
         ProtocolMessage::Register { username, machine, pubkey } => {
@@ -145,15 +155,15 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
             // aborted or forged registration cannot squat a username or enroll a key it never
             // held (DESIGN.md §5.1). The Auth must carry the same key that is being registered.
             let ProtocolMessage::Auth { pubkey: auth_pubkey, signature } = inbound.recv().await? else {
-                let _ = outbound.send(err(ProtocolError::MalformedFrame("expected Auth after Register".to_owned())));
+                let _ = outbound.try_send(err(ProtocolError::MalformedFrame("expected Auth after Register".to_owned())));
                 return None;
             };
             if auth_pubkey != pubkey {
-                let _ = outbound.send(err(ProtocolError::Unauthorized("auth key does not match the registered key".to_owned())));
+                let _ = outbound.try_send(err(ProtocolError::Unauthorized("auth key does not match the registered key".to_owned())));
                 return None;
             }
             if let Err(e) = identity::verify(&auth_pubkey, &nonce, &signature) {
-                let _ = outbound.send(err(e.into()));
+                let _ = outbound.try_send(err(e.into()));
                 return None;
             }
             // Reject an empty or `/`-bearing username / machine name before persisting it (T-006).
@@ -162,26 +172,26 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
             }
             // Possession proven — only now durably claim the username and enroll the key.
             if let Err(e) = hub.register(&username, &machine, &pubkey).await {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
                 return None;
             }
             (username, machine)
         }
         ProtocolMessage::Auth { pubkey, signature } => {
             if let Err(e) = identity::verify(&pubkey, &nonce, &signature) {
-                let _ = outbound.send(err(e.into()));
+                let _ = outbound.try_send(err(e.into()));
                 return None;
             }
             match hub.resolve(&pubkey).await {
                 Ok(resolved) => resolved,
                 Err(e) => {
-                    let _ = outbound.send(err(e));
+                    let _ = outbound.try_send(err(e));
                     return None;
                 }
             }
         }
         _ => {
-            let _ = outbound.send(err(ProtocolError::MalformedFrame("expected Register or Auth".to_owned())));
+            let _ = outbound.try_send(err(ProtocolError::MalformedFrame("expected Register or Auth".to_owned())));
             return None;
         }
     };
@@ -194,13 +204,13 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
     let kill = match hub.attach(&path, &user, &machine, outbound.clone()) {
         Ok(kill) => kill,
         Err(e) => {
-            let _ = outbound.send(err(e));
+            let _ = outbound.try_send(err(e));
             return None;
         }
     };
-    let _ = outbound.send(ProtocolMessage::Established { path: path.clone() });
+    let _ = outbound.try_send(ProtocolMessage::Established { path: path.clone() });
     // Advertise the server-wide role so the bridge can gate its admin tools (DESIGN.md §7).
-    let _ = outbound.send(ProtocolMessage::ServerInfo { admin: hub.is_admin(&user) });
+    let _ = outbound.try_send(ProtocolMessage::ServerInfo { admin: hub.is_admin(&user) });
     Some(SessionCtx { path, kill })
 }
 
@@ -209,58 +219,58 @@ async fn handle_frame(hub: &Arc<Hub>, ctx: &SessionCtx, outbound: &Outbound, fra
     let user = &ctx.path.user;
     match frame {
         ProtocolMessage::Ping => {
-            let _ = outbound.send(ProtocolMessage::Pong);
+            let _ = outbound.try_send(ProtocolMessage::Pong);
         }
         ProtocolMessage::Join { channel, token } => match hub.join(user, &ctx.path, &channel, token.as_deref()).await {
             Ok(()) => {
-                let _ = outbound.send(ProtocolMessage::Joined { channel });
+                let _ = outbound.try_send(ProtocolMessage::Joined { channel });
             }
             Err(e) => {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
             }
         },
         ProtocolMessage::Leave { channel } => {
             hub.leave(&ctx.path, &channel);
-            let _ = outbound.send(ProtocolMessage::Ack { detail: Some(channel) });
+            let _ = outbound.try_send(ProtocolMessage::Ack { detail: Some(channel) });
         }
         ProtocolMessage::Who { channel } => match hub.who(user, channel.as_deref()).await {
             Ok(sessions) => {
-                let _ = outbound.send(ProtocolMessage::Presence { channel, sessions });
+                let _ = outbound.try_send(ProtocolMessage::Presence { channel, sessions });
             }
             Err(e) => {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
             }
         },
         ProtocolMessage::ListChannels => match hub.list_channels(user).await {
             Ok(channels) => {
-                let _ = outbound.send(ProtocolMessage::ChannelList { channels });
+                let _ = outbound.try_send(ProtocolMessage::ChannelList { channels });
             }
             Err(e) => {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
             }
         },
         ProtocolMessage::ListMachines => match hub.list_machines(user).await {
             Ok(machines) => {
-                let _ = outbound.send(ProtocolMessage::MachineList { machines });
+                let _ = outbound.try_send(ProtocolMessage::MachineList { machines });
             }
             Err(e) => {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
             }
         },
         ProtocolMessage::ListUsers => match hub.list_users(user).await {
             Ok(users) => {
-                let _ = outbound.send(ProtocolMessage::UserList { users });
+                let _ = outbound.try_send(ProtocolMessage::UserList { users });
             }
             Err(e) => {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
             }
         },
         ProtocolMessage::Admin(op) => match hub.admin(user, op).await {
             Ok(reply) => {
-                let _ = outbound.send(reply);
+                let _ = outbound.try_send(reply);
             }
             Err(e) => {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
             }
         },
         // The client-supplied `from` is ignored; the server stamps the authenticated path (§12).
@@ -268,23 +278,23 @@ async fn handle_frame(hub: &Arc<Hub>, ctx: &SessionCtx, outbound: &Outbound, fra
         // (PRD-0008 T-001); the ack is not fanned out to other subscribers.
         ProtocolMessage::ChannelMsg { channel, payload, .. } => match hub.post(&ctx.path, &channel, payload) {
             Ok(()) => {
-                let _ = outbound.send(ProtocolMessage::Ack { detail: None });
+                let _ = outbound.try_send(ProtocolMessage::Ack { detail: None });
             }
             Err(e) => {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
             }
         },
         ProtocolMessage::Whisper { target, payload, .. } => match hub.whisper(&ctx.path, &target, payload) {
             Ok(()) => {
-                let _ = outbound.send(ProtocolMessage::Ack { detail: None });
+                let _ = outbound.try_send(ProtocolMessage::Ack { detail: None });
             }
             Err(e) => {
-                let _ = outbound.send(err(e));
+                let _ = outbound.try_send(err(e));
             }
         },
         // Server→client frames (and the handshake frames) are never valid inbound mid-session.
         _ => {
-            let _ = outbound.send(err(ProtocolError::MalformedFrame("unexpected frame from client".to_owned())));
+            let _ = outbound.try_send(err(ProtocolError::MalformedFrame("unexpected frame from client".to_owned())));
         }
     }
     ControlFlow::Continue(())
@@ -296,7 +306,7 @@ fn accept_component(outbound: &Outbound, label: &str, value: &str) -> bool {
     if SessionPath::validate_component(value).is_ok() {
         return true;
     }
-    let _ = outbound.send(err(ProtocolError::MalformedFrame(format!("invalid {label}: `{value}`"))));
+    let _ = outbound.try_send(err(ProtocolError::MalformedFrame(format!("invalid {label}: `{value}`"))));
     false
 }
 
