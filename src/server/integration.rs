@@ -162,7 +162,7 @@ fn is_not_found(frame: &ProtocolMessage) -> bool {
 }
 
 // -----------------------------------------------------------------------------
-// uat-001 — registration + enrollment; duplicate username / live handle rejected.
+// uat-001 — registration + enrollment; duplicate username rejected, stale live handle superseded.
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -199,17 +199,24 @@ async fn server_register_rejects_duplicate_username() {
 }
 
 #[tokio::test]
-async fn server_register_rejects_duplicate_live_handle() {
+async fn server_reconnect_supersedes_a_stale_live_handle() {
     let hub = hub().await;
     let id = Identity::generate().unwrap();
 
     let mut a = Client::connect(&hub);
     established_path(a.register(&id, "aaron", "workstation", "razel").await);
 
-    // The same (user, machine) with the same live handle collides — two sessions can't share a path.
+    // A fresh authenticated session for the same path takes over immediately — a half-open reconnect
+    // must not wait out the idle reaper (#16). The new session is established...
     let mut b = Client::connect(&hub);
-    let response = b.authenticate(&id, "razel").await;
-    assert!(is_unauthorized(&response), "duplicate live handle must be rejected, got {response:?}");
+    let path = established_path(b.authenticate(&id, "razel").await);
+    assert_eq!(path, SessionPath::new("aaron", "workstation", "razel"));
+
+    // ...and the superseded session is force-dropped (a termination frame, then its transport closes).
+    match a.try_recv().await {
+        Some(ProtocolMessage::Error(_)) | None => {}
+        other => panic!("the superseded session must be terminated, got {other:?}"),
+    }
 }
 
 // -----------------------------------------------------------------------------

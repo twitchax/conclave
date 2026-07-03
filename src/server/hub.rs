@@ -152,10 +152,15 @@ impl Hub {
     }
 
     /// Registers a live session and returns its kill handle, rejecting a duplicate live path (§5).
-    pub(crate) fn attach(&self, path: &SessionPath, user: &str, machine: &str, outbound: Outbound) -> Result<Arc<Notify>, ProtocolError> {
+    pub(crate) fn attach(&self, path: &SessionPath, user: &str, machine: &str, outbound: Outbound) -> Arc<Notify> {
         let mut st = self.state();
-        if st.sessions.contains_key(path) {
-            return Err(AuthError::HandleCollision(path.session.clone()).into());
+        // A fresh authenticated session for this path supersedes any prior one, so a reconnect after
+        // an ungraceful (half-open) drop takes over immediately instead of waiting out the idle
+        // reaper (#16). Possession is already proven at auth, so only the identity holder can take
+        // over its own handle; a true duplicate (same handle, two live processes) is last-writer-wins.
+        if let Some(existing) = st.sessions.get(path) {
+            existing.kill.notify_one();
+            Self::take_session(&mut st, path);
         }
 
         let kill = Arc::new(Notify::new());
@@ -170,13 +175,16 @@ impl Hub {
                 last_seen: Instant::now(),
             },
         );
-        Ok(kill)
+        kill
     }
 
-    /// Removes a session's presence and subscriptions (on clean disconnect); idempotent.
-    pub(crate) fn detach(&self, path: &SessionPath) {
+    /// Removes a session's presence and subscriptions (on clean disconnect); idempotent. Guarded by
+    /// session identity so a session that was superseded (#16) does not evict its replacement.
+    pub(crate) fn detach(&self, path: &SessionPath, kill: &Arc<Notify>) {
         let mut st = self.state();
-        Self::take_session(&mut st, path);
+        if st.sessions.get(path).is_some_and(|e| Arc::ptr_eq(&e.kill, kill)) {
+            Self::take_session(&mut st, path);
+        }
     }
 
     /// Refreshes a session's heartbeat timestamp on any inbound activity (DESIGN.md §10).
@@ -686,7 +694,7 @@ mod tests {
         let path = SessionPath::new(user, "machine", "session");
         // The outbound receiver is unused (these tests don't fan out); attach only needs the sender.
         let (tx, _rx) = mpsc::channel(super::super::session::OUTBOUND_CAPACITY);
-        hub.attach(&path, user, "machine", tx).unwrap();
+        hub.attach(&path, user, "machine", tx);
         path
     }
 
@@ -702,7 +710,7 @@ mod tests {
 
         let bob = SessionPath::new("bob", "machine", "session");
         let (b_tx, _b_rx) = mpsc::channel(1);
-        let b_kill = hub.attach(&bob, "bob", "machine", b_tx).unwrap();
+        let b_kill = hub.attach(&bob, "bob", "machine", b_tx);
         hub.join("bob", &bob, "ops", None).await.unwrap();
 
         // Fill bob's 1-slot queue, then overflow it — the second post cannot enqueue.

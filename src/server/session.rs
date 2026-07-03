@@ -79,7 +79,7 @@ pub(crate) async fn run_session(hub: Arc<Hub>, mut inbound: Inbound, outbound: O
         }
     }
 
-    hub.detach(&ctx.path);
+    hub.detach(&ctx.path, &ctx.kill);
 }
 
 /// Adapts a length-delimited byte stream (duplex / TCP) into [`run_session`] via pump tasks.
@@ -201,13 +201,8 @@ async fn handshake(hub: &Arc<Hub>, inbound: &mut Inbound, outbound: &Outbound) -
         return None;
     }
     let path = SessionPath::new(user.clone(), machine.clone(), session);
-    let kill = match hub.attach(&path, &user, &machine, outbound.clone()) {
-        Ok(kill) => kill,
-        Err(e) => {
-            let _ = outbound.try_send(err(e));
-            return None;
-        }
-    };
+    // Infallible: a fresh authenticated session supersedes any prior one on this path (#16).
+    let kill = hub.attach(&path, &user, &machine, outbound.clone());
     let _ = outbound.try_send(ProtocolMessage::Established { path: path.clone() });
     // Advertise the server-wide role so the bridge can gate its admin tools (DESIGN.md §7).
     let _ = outbound.try_send(ProtocolMessage::ServerInfo { admin: hub.is_admin(&user) });
