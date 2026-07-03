@@ -13,7 +13,9 @@ primary_region = "sjc"
 [env]
   CONCLAVE_BIND = "0.0.0.0:4390"
   CONCLAVE_DATA_DIR = "/data"
-  RUST_LOG = "info"
+  # `conclavelib=debug` exports the per-request spans (join/post/read_since/…) to logs and OTLP
+  # without SurrealDB's debug noise; drop to plain "info" for lifecycle-only.
+  RUST_LOG = "info,conclavelib=debug"
   # Observability (PRD-0014). `RUST_LOG=debug` adds per-request spans and frame dispatch;
   # uncomment for structured log pipelines / an OTLP collector (base URL — /v1/traces is appended).
   # Authenticated collectors (Grafana Cloud etc.) take the standard headers env; set BOTH of these
