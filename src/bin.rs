@@ -220,17 +220,8 @@ async fn run_join(explicit: Option<&PathBuf>, args: &JoinArgs) -> Void {
     let dir = config_dir(explicit)?;
     let identity = load_identity(explicit)?;
 
-    if let Some(perm) = &args.perm {
-        let level: PermissionLevel = perm.parse().map_err(anyhow::Error::from)?;
-        let mut config = identity::load_config(&dir)?;
-        config.overrides.retain(|o| !(o.server == args.server && o.channel.as_deref() == Some(args.channel.as_str())));
-        config.overrides.push(PermissionOverride {
-            server: args.server.clone(),
-            channel: Some(args.channel.clone()),
-            level,
-        });
-        identity::save_config(&dir, &config)?;
-    }
+    // Parse the perm up front so a bad value fails before we touch the server.
+    let perm = args.perm.as_deref().map(str::parse::<PermissionLevel>).transpose().map_err(anyhow::Error::from)?;
 
     let response = control::one_shot(
         &args.server,
@@ -242,7 +233,21 @@ async fn run_join(explicit: Option<&PathBuf>, args: &JoinArgs) -> Void {
         },
     )
     .await?;
+    // Bails on an `Error` frame — so a rejected join never reaches the persist below (#24).
     print_response(response)?;
+
+    // Only now that the server has accepted the join do we persist the local permission override.
+    if let Some(level) = perm {
+        let mut config = identity::load_config(&dir)?;
+        config.overrides.retain(|o| !(o.server == args.server && o.channel.as_deref() == Some(args.channel.as_str())));
+        config.overrides.push(PermissionOverride {
+            server: args.server.clone(),
+            channel: Some(args.channel.clone()),
+            level,
+        });
+        identity::save_config(&dir, &config)?;
+    }
+
     eprintln!("note: verified access and set the local permission; your live session subscribes via the /conclave skill's join_channel tool.");
     Ok(())
 }
@@ -254,7 +259,13 @@ fn run_perm(explicit: Option<&PathBuf>, command: &PermCommand) -> Void {
             let level: PermissionLevel = level.parse().map_err(anyhow::Error::from)?;
             let mut config = identity::load_config(&dir)?;
             if let Some(server) = server {
-                let scope_channel = if *whisper { None } else { channel.clone() };
+                // Require exactly one explicit scope so `--server` can't silently pick whisper (#25).
+                let scope_channel = match (channel, *whisper) {
+                    (Some(channel), false) => Some(channel.clone()),
+                    (None, true) => None,
+                    (None, false) => anyhow::bail!("--server needs an explicit scope: pass --channel <name> or --whisper"),
+                    (Some(_), true) => anyhow::bail!("--channel and --whisper are mutually exclusive"),
+                };
                 config.overrides.retain(|o| !(o.server == *server && o.channel == scope_channel));
                 config.overrides.push(PermissionOverride {
                     server: server.clone(),
@@ -834,6 +845,9 @@ enum SkillCommand {
 
 #[cfg(test)]
 mod tests {
+    // Tests relax `unwrap_used` (house convention; DESIGN.md §22).
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use clap::CommandFactory;
     use pretty_assertions::assert_eq;
@@ -858,6 +872,44 @@ mod tests {
             Command::Serve(args) => assert_eq!(args.bind, "127.0.0.1:9000"),
             other => panic!("expected `serve`, parsed {other:?}"),
         }
+    }
+
+    #[test]
+    fn perm_scope_with_server_requires_an_unambiguous_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        // `--server` with neither scope is ambiguous — previously it silently wrote the whisper scope.
+        let ambiguous = PermCommand::Set {
+            level: "converse".to_owned(),
+            server: Some("wss://s1".to_owned()),
+            channel: None,
+            whisper: false,
+        };
+        let err = run_perm(Some(&dir), &ambiguous).expect_err("--server with no scope must be rejected");
+        assert!(err.to_string().contains("explicit scope"), "{err}");
+
+        // `--channel` and `--whisper` together are contradictory.
+        let conflicting = PermCommand::Set {
+            level: "converse".to_owned(),
+            server: Some("wss://s1".to_owned()),
+            channel: Some("ops".to_owned()),
+            whisper: true,
+        };
+        let err = run_perm(Some(&dir), &conflicting).expect_err("--channel + --whisper must be rejected");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+
+        // An explicit whisper scope is accepted and persisted.
+        let explicit = PermCommand::Set {
+            level: "converse".to_owned(),
+            server: Some("wss://s1".to_owned()),
+            channel: None,
+            whisper: true,
+        };
+        run_perm(Some(&dir), &explicit).expect("an explicit whisper scope is accepted");
+        let config = identity::load_config(&dir).unwrap();
+        assert_eq!(config.overrides.len(), 1);
+        assert_eq!(config.overrides[0].channel, None);
     }
 
     #[test]

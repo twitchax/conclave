@@ -312,8 +312,19 @@ pub fn save_config(dir: &Path, config: &Config) -> Void {
 
     let path = dir.join("config.toml");
     let text = toml::to_string_pretty(config).context("failed to serialize config")?;
-    fs::write(&path, text).with_context(|| format!("failed to write config `{}`", path.display()))?;
+    atomic_write(&path, &text)?;
 
+    Ok(())
+}
+
+/// Writes `contents` to `path` atomically: a per-process temp file in the same directory, then a
+/// rename. A crash mid-write can only truncate the temp — the live file is replaced in one atomic
+/// step, so it is never left partial to brick every later verb (PRD-0008 T-006, #26).
+fn atomic_write(path: &Path, contents: &str) -> Void {
+    let name = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("conclave");
+    let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
+    fs::write(&tmp, contents).with_context(|| format!("failed to write temp file `{}`", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to replace `{}`", path.display()))?;
     Ok(())
 }
 
@@ -516,6 +527,34 @@ mod tests {
     fn load_config_defaults_when_absent() {
         let dir = TempDir::new().unwrap();
         assert_eq!(load_config(dir.path()).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn save_config_atomic_round_trips_and_leaves_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            default_permission: PermissionLevel::Converse,
+            ..Config::default()
+        };
+
+        save_config(dir.path(), &config).unwrap();
+        assert_eq!(load_config(dir.path()).unwrap(), config);
+
+        // The atomic temp file was renamed away — no `.tmp` residue is left to confuse later runs.
+        let residue: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(residue.is_empty(), "atomic write must leave no temp file: {residue:?}");
+
+        // Overwriting an existing config replaces it completely (no truncation / partial merge).
+        let updated = Config {
+            default_permission: PermissionLevel::Act,
+            ..config
+        };
+        save_config(dir.path(), &updated).unwrap();
+        assert_eq!(load_config(dir.path()).unwrap(), updated);
     }
 
     #[test]
