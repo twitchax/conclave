@@ -21,7 +21,10 @@ use ring::{
     rand::{SecureRandom as _, SystemRandom},
     signature::{self, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey},
 };
-use secrecy::{ExposeSecret as _, SecretBox};
+use secrecy::{
+    ExposeSecret as _, SecretBox,
+    zeroize::{Zeroize as _, Zeroizing},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -86,9 +89,10 @@ impl Identity {
     ///
     /// Returns an error if the OS random source cannot be read or the seed is rejected.
     pub fn generate() -> Res<Self> {
-        let mut seed = [0_u8; SEED_LEN];
-        SystemRandom::new().fill(&mut seed).map_err(|_| anyhow::anyhow!("failed to gather entropy"))?;
-        Self::from_seed(seed)
+        // The generated seed is zeroized on drop; `from_seed` zeroizes the copy it takes (#28).
+        let mut seed = Zeroizing::new([0_u8; SEED_LEN]);
+        SystemRandom::new().fill(&mut *seed).map_err(|_| anyhow::anyhow!("failed to gather entropy"))?;
+        Self::from_seed(*seed)
     }
 
     /// Reconstructs an identity from its 32-byte seed.
@@ -96,14 +100,17 @@ impl Identity {
     /// # Errors
     ///
     /// Returns an error if the seed is rejected by the signing backend.
-    pub fn from_seed(seed: [u8; SEED_LEN]) -> Res<Self> {
+    pub fn from_seed(mut seed: [u8; SEED_LEN]) -> Res<Self> {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|e| anyhow::anyhow!("invalid Ed25519 seed: {e}"))?;
         let public_key = key_pair.public_key().as_ref().try_into().context("unexpected public key length")?;
 
-        Ok(Self {
+        let identity = Self {
             secret_seed: SecretBox::new(Box::new(seed)),
             public_key,
-        })
+        };
+        // The `SecretBox` holds the only resident copy — wipe the plaintext argument (#28).
+        seed.zeroize();
+        Ok(identity)
     }
 
     /// This identity's raw 32-byte public key.
@@ -278,13 +285,44 @@ pub fn default_config_dir() -> Res<PathBuf> {
 ///
 /// Returns an error if the directory or file cannot be created or written.
 pub fn save_identity(dir: &Path, identity: &Identity) -> Void {
+    use std::io::Write as _;
+
     fs::create_dir_all(dir).with_context(|| format!("failed to create keystore directory `{}`", dir.display()))?;
 
     let key_file = dir.join("key");
-    fs::write(&key_file, identity.secret_seed_base64()).with_context(|| format!("failed to write keyfile `{}`", key_file.display()))?;
+    // Create with owner-only mode from the start so the seed is never briefly world-readable (#33);
+    // the base64 seed is wiped once written (#28).
+    let seed_b64 = Zeroizing::new(identity.secret_seed_base64());
+    let mut file = create_key_file(&key_file)?;
+    file.write_all(seed_b64.as_bytes()).with_context(|| format!("failed to write keyfile `{}`", key_file.display()))?;
+    // Belt-and-suspenders: fix the mode if the file already existed with looser permissions.
     restrict_permissions(&key_file)?;
 
     Ok(())
+}
+
+/// Opens `dir/key` for writing, creating it with owner-only (0600) permissions on unix so the seed
+/// is never written through a world-readable file (PRD-0008 T-007, #33).
+#[cfg(unix)]
+fn create_key_file(path: &Path) -> Res<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to create keyfile `{}`", path.display()))
+}
+
+#[cfg(not(unix))]
+fn create_key_file(path: &Path) -> Res<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("failed to create keyfile `{}`", path.display()))
 }
 
 /// Loads the identity whose seed is stored at `dir/key`.
@@ -294,12 +332,16 @@ pub fn save_identity(dir: &Path, identity: &Identity) -> Void {
 /// Returns an error if the keyfile is missing or does not contain a valid 32-byte seed.
 pub fn load_identity(dir: &Path) -> Res<Identity> {
     let key_file = dir.join("key");
-    let contents = fs::read_to_string(&key_file).with_context(|| format!("failed to read keyfile `{}` (run `conclave key` first)", key_file.display()))?;
+    // Wipe every plaintext copy of the seed material on the way in (#28).
+    let contents = Zeroizing::new(fs::read_to_string(&key_file).with_context(|| format!("failed to read keyfile `{}` (run `conclave key` first)", key_file.display()))?);
 
-    let seed_bytes = decode_key(&contents)?;
-    let seed: [u8; SEED_LEN] = seed_bytes.as_slice().try_into().context("keyfile does not contain a 32-byte seed")?;
+    let mut seed_bytes = decode_key(&contents)?;
+    let mut seed: [u8; SEED_LEN] = seed_bytes.as_slice().try_into().context("keyfile does not contain a 32-byte seed")?;
+    seed_bytes.zeroize();
 
-    Identity::from_seed(seed)
+    let identity = Identity::from_seed(seed);
+    seed.zeroize();
+    identity
 }
 
 /// Writes the local configuration to `dir/config.toml`.

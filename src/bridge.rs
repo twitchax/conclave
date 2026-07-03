@@ -258,6 +258,11 @@ impl BridgeCore {
     }
 
     fn defer_admin(&mut self, id: &Value, server: &str, op: AdminOp) {
+        // Scope admin ops to servers that actually asserted admin for this user, so one server
+        // claiming admin cannot confer admin power against another home (PRD-0008 T-007, #31).
+        if !self.admin_servers.contains(server) {
+            return self.send_mcp(mcp::tool_error_result(id, &format!("not an admin on `{server}`")));
+        }
         self.defer(id, server, None);
         self.send_to_server(server, ProtocolMessage::Admin(op));
     }

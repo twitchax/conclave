@@ -463,3 +463,30 @@ fn bridge_link_state_changes_notify_the_session() {
         "a reconnect must surface a reconnect notice",
     );
 }
+
+#[test]
+fn bridge_admin_tool_is_scoped_to_a_server_that_asserted_admin() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    // No ServerInfo{admin} received yet → an admin op on s1 is refused and never reaches the server.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(1),
+        name: "create_channel".to_owned(),
+        args: json!({ "name": "ops" }),
+    });
+    let result = harness.to_mcp_rx.try_recv().unwrap();
+    assert_eq!(result.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+    assert!(harness.to_server_rx.try_recv().is_err(), "a non-admin admin op must not reach the server");
+
+    // Once s1 asserts admin, the same op is forwarded.
+    harness.core.handle_inbound("s1", ProtocolMessage::ServerInfo { admin: true });
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(2),
+        name: "create_channel".to_owned(),
+        args: json!({ "name": "ops" }),
+    });
+    assert!(
+        matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Admin(_)),
+        "an admin op on a server that asserted admin is forwarded",
+    );
+}

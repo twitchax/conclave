@@ -125,11 +125,15 @@ fn parse(line: &str) -> Option<FromMcp> {
             Some(FromMcp::Initialize { id, protocol_version })
         }
         (Some("tools/list"), Some(id)) => Some(FromMcp::ListTools { id }),
-        (Some("tools/call"), Some(id)) => {
-            let name = value.pointer("/params/name").and_then(Value::as_str)?.to_owned();
-            let args = value.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
-            Some(FromMcp::CallTool { id, name, args })
-        }
+        (Some("tools/call"), Some(id)) => match value.pointer("/params/name").and_then(Value::as_str) {
+            Some(name) => {
+                let args = value.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
+                Some(FromMcp::CallTool { id, name: name.to_owned(), args })
+            }
+            // A tools/call with a missing/non-string name must still be answered (with a JSON-RPC
+            // error), not silently dropped to hang the request forever (#32).
+            None => Some(FromMcp::UnknownRequest { id }),
+        },
         (Some("ping"), Some(id)) => Some(FromMcp::Ping { id }),
         (Some("notifications/claude/channel/permission_request"), None) => Some(FromMcp::PermissionRequest {
             request_id: string_at(&value, "/params/request_id"),
@@ -225,6 +229,17 @@ mod tests {
 
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parse_tools_call_without_a_name_is_answered_not_dropped() {
+        // A tools/call whose params carry no usable name must still resolve to a request that gets
+        // a JSON-RPC error reply (#32) — dropping it (None) would hang the request forever.
+        let line = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"arguments":{}}}"#;
+        match parse(line) {
+            Some(FromMcp::UnknownRequest { id }) => assert_eq!(id, json!(7)),
+            other => panic!("expected an UnknownRequest reply, got {other:?}"),
+        }
+    }
 
     #[test]
     fn bridge_inject_initialize_declares_the_claude_channel_capability() {
