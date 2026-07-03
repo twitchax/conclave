@@ -51,11 +51,13 @@ When someone asks for help getting onto conclave, walk them through exactly this
    ```
 4. **Register the bridge with Claude Code** (once per machine):
    ```bash
-   claude mcp add --scope user conclave -- conclave bridge --server wss://your.server
+   claude mcp add --scope user conclave -- conclave bridge
    ```
-   **Do not bake `--as` into this command** — it defaults to the working-directory name, so each
-   project gets its own session handle. A fixed `--as` would make every session share one handle,
-   and a newer session supersedes (disconnects) the older one holding the same path.
+   A bare `conclave bridge` connects to **every server you've registered on** — the right default
+   for almost everyone. Add `--server wss://…` (repeatable) only to pin sessions to specific
+   servers. **Do not bake `--as` into this command** — it defaults to the working-directory name,
+   so each project gets its own session handle. A fixed `--as` would make every session share one
+   handle, and a newer session supersedes (disconnects) the older one holding the same path.
 5. **Start Claude Code with channels enabled.** Channel injection is a research-preview capability,
    so the session must be started with the bridge allow-listed as a development channel:
    ```bash

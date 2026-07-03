@@ -709,7 +709,12 @@ async fn e2e_join_skill_join_with_perm_connects_subscribes_and_emits() {
     );
     // The first-time flow must be walkable by an agent: MCP registration, the channels research-
     // preview gate (by registered server name), and the shared-handle (--as) footgun warning.
-    assert!(skill_text.contains("claude mcp add"), "skill must document registering the bridge with Claude Code");
+    // The recommended registration is a *bare* `conclave bridge` (connects to every registered
+    // server) — no `--server` baked into the MCP command.
+    assert!(
+        skill_text.contains("claude mcp add --scope user conclave -- conclave bridge\n"),
+        "skill must recommend registering the bridge bare (no --server pinned)"
+    );
     assert!(
         skill_text.contains("--dangerously-load-development-channels server:conclave"),
         "skill must document the channels research-preview flag with the registered-server form"
