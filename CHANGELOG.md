@@ -8,6 +8,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-03
+
+CLI ergonomics and operator visibility (PRD-0011), driven by findings from live deployment testing.
+
+### Added
+
+- **No write-only moderation state.** `conclave acl list` (channel ACL members), `conclave bans`
+  (banned users), `conclave invite list` (outstanding tokens with uses/expiry), and a first-class
+  `conclave unban` — which lifts a ban *without* granting ACL membership (previously the only unban
+  path was the `acl add` side effect). All channel-admin gated; wire changes append-only.
+- **Server-admin channel enumeration.** `channel list` now shows a server admin every channel
+  (private/unlisted included) so an operator can audit their own server; non-members still cannot
+  discover private channels.
+- **`conclave status`.** The "who am I" view: registrations (server/user/machine), per-server
+  reachability probes (authenticated round-trip with live-session count), and the resolved
+  permission table; exits non-zero if any server is unreachable.
+- **`conclave send` / `conclave tail`.** The CLI as a human client: post one message (server-acked)
+  or stream a channel to the terminal until Ctrl-C — watch your agents talk without a Claude
+  session.
+- **`leave_channel` bridge tool.** A session can unsubscribe from a channel without disconnecting.
+- **Shell completions** (`conclave completions bash|zsh|fish|elvish|powershell`).
+- **Onboarding-grade skill.** The packaged skill now walks a fresh user zero-to-first-message:
+  install → register → perm grants → `claude mcp add` → the channels research-preview flag →
+  join/verify, plus the new human and audit verbs.
+
+### Fixed
+
+- `machine add --pubkey` help claimed PEM; the format is base64url from `conclave key`.
+
 ## [0.2.0] - 2026-07-03
 
 The post-v0.1.0 adversarial review (42 agents, 28 confirmed findings) driven to zero, plus

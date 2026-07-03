@@ -587,7 +587,7 @@ enum Command {
         #[command(subcommand)]
         command: AclCommand,
     },
-    /// Create or revoke channel invite tokens.
+    /// Create, list, or revoke channel invite tokens.
     Invite {
         #[command(subcommand)]
         command: InviteCommand,
