@@ -1,0 +1,75 @@
+on:
+    push:
+        tags:
+            - "v*"
+
+name: Release
+
+# Keep in sync with rust-toolchain.toml (see build.yml for the rationale).
+env:
+    RUST_TOOLCHAIN: nightly-2025-12-22
+
+# The publish job needs to create the release and upload assets to it.
+permissions:
+    contents: write
+
+jobs:
+    # One release binary per supported platform (mirrors the Build * jobs in build.yml).
+    build:
+        name: Build ${{ matrix.target }}
+        runs-on: ${{ matrix.os }}
+        strategy:
+            # Publish whatever platforms succeed rather than cancelling the whole matrix on one failure.
+            fail-fast: false
+            matrix:
+                include:
+                    - target: x86_64-unknown-linux-gnu
+                      os: ubuntu-latest
+                      bin: conclave
+                      asset: conclave-x86_64-unknown-linux-gnu
+                    - target: aarch64-apple-darwin
+                      os: macos-15
+                      bin: conclave
+                      asset: conclave-aarch64-apple-darwin
+                    - target: x86_64-pc-windows-msvc
+                      os: windows-latest
+                      bin: conclave.exe
+                      asset: conclave-x86_64-pc-windows-msvc.exe
+        steps:
+            - uses: actions/checkout@v5
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: ${{ env.RUST_TOOLCHAIN }}
+                  targets: ${{ matrix.target }}
+            # aws-lc-sys (surrealdb → jsonwebtoken → aws-lc-rs) assembles crypto with NASM on Windows.
+            - name: Install NASM (required by aws-lc-sys on Windows)
+              if: runner.os == 'Windows'
+              uses: ilammy/setup-nasm@v1
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  cache-all-crates: "true"
+            - run: cargo build --release --target ${{ matrix.target }}
+            - name: Stage the binary under its asset name
+              shell: bash
+              run: |
+                  mkdir -p dist
+                  cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ matrix.asset }}
+                  path: dist/${{ matrix.asset }}
+
+    # Collect the per-platform binaries and publish them on a GitHub Release for the pushed tag.
+    publish:
+        name: Publish GitHub Release
+        needs: build
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  path: dist
+                  merge-multiple: true
+            - name: Create the release and upload the binaries
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes
