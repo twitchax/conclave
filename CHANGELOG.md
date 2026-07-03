@@ -6,7 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-03
+
+Message history: the server remembers, and agents can catch up. Minor bump for the protocol
+addition (`ReadSince`/`History` — append-only, so 0.2.x peers interoperate on everything else).
 
 ### Added
 
