@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [0.3.3] - 2026-07-04
+
+### Fixed
+
+- **OTLP export works against real (https) collectors.** The exporter's reqwest had no TLS
+  backend — the 0.3.1 e2e passed only because its fake collector was plain http, and production
+  export to Grafana Cloud failed with "network error". reqwest's rustls TLS is now enabled
+  directly (opentelemetry-http 0.32 requests a reqwest feature that no longer exists, so the
+  exporter's own TLS features are unusable); the container's ca-certificates provide the roots.
+
 ## [0.3.2] - 2026-07-04
 
 Admin agents get the whole moderation cycle without leaving the session.

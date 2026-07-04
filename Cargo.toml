@@ -1,6 +1,6 @@
 [package]
 name = "conclave-cli"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 resolver = "2"
 authors = ["Aaron Roney <twitchax@gmail.com>"]
@@ -75,6 +75,11 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter",
 opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+# Direct dep ONLY to switch on reqwest's TLS for the OTLP exporter (feature unification):
+# opentelemetry-http 0.32 asks reqwest for a `webpki-roots` feature that no longer exists in
+# reqwest 0.13, so the exporter's own TLS features are unusable — without this, an https://
+# collector fails with "network error". Platform roots: the runtime image ships ca-certificates.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 tracing-opentelemetry = "0.33.0"
 
 # One-shot CLI verbs restore the default SIGPIPE disposition so `conclave … | head` dies quietly
