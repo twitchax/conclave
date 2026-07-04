@@ -28,7 +28,7 @@ use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader, Lines},
     net::TcpStream,
     process::{ChildStdin, ChildStdout},
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -194,21 +194,45 @@ async fn e2e_serve_log_format_json_emits_parseable_lines() {
     assert_eq!(value.pointer("/fields/message").and_then(Value::as_str), Some("conclave server listening"), "unexpected shape: {value}");
 }
 
-#[tokio::test]
-async fn e2e_serve_exports_otlp_spans_when_endpoint_is_set() {
-    // A fake OTLP collector: accept one HTTP request, hand its head to the test (PRD-0014 T-002).
+/// A fake OTLP collector serving every connection with a 200; each request's head (first 4 KiB)
+/// is forwarded to the test. The span and log exporters POST independently to the same base URL
+/// (PRD-0014 / PRD-0017), so tests receive hits in arrival order and pick out their signal path.
+async fn spawn_fake_otlp_collector() -> (std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<String>) {
     let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let collector_addr = collector.local_addr().unwrap();
-    let (hit_tx, hit_rx) = tokio::sync::oneshot::channel();
+    let (hit_tx, hit_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Ok((mut socket, _)) = collector.accept().await {
-            use tokio::io::AsyncWriteExt as _;
-            let mut buf = vec![0_u8; 4096];
-            let n = socket.read(&mut buf).await.unwrap_or(0);
-            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
-            let _ = hit_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+        while let Ok((mut socket, _)) = collector.accept().await {
+            let tx = hit_tx.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let mut buf = vec![0_u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            });
         }
     });
+    (collector_addr, hit_rx)
+}
+
+/// Receives collector hits until one names the wanted signal path (e.g. `/v1/traces`).
+async fn otlp_hit_for(hit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>, signal_path: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let head = timeout_at(deadline, hit_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no OTLP export for {signal_path} arrived within 20s"))
+            .unwrap();
+        if head.contains(signal_path) {
+            break head;
+        }
+    }
+}
+
+#[tokio::test]
+async fn e2e_serve_exports_otlp_spans_when_endpoint_is_set() {
+    let (collector_addr, mut hit_rx) = spawn_fake_otlp_collector().await;
 
     let addr = free_loopback_addr();
     let _server = ServerProcess(
@@ -231,11 +255,39 @@ async fn e2e_serve_exports_otlp_spans_when_endpoint_is_set() {
     let mut ws = ws_connect(addr).await;
     ws_register(&mut ws, &Identity::generate().unwrap(), "aaron", "workstation", "otel").await;
 
-    let head = timeout(Duration::from_secs(20), hit_rx).await.expect("no OTLP export arrived within 20s").unwrap();
-    assert!(head.starts_with("POST") && head.contains("/v1/traces"), "expected an OTLP trace POST, got: {head}");
+    let head = otlp_hit_for(&mut hit_rx, "/v1/traces").await;
+    assert!(head.starts_with("POST"), "expected an OTLP trace POST, got: {head}");
     assert!(
         head.to_ascii_lowercase().contains("authorization: basic dgvzdc10b2tlbg=="),
         "OTEL_EXPORTER_OTLP_HEADERS must reach the collector (Grafana Cloud auth): {head}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_serve_exports_otlp_logs_when_endpoint_is_set() {
+    let (collector_addr, mut hit_rx) = spawn_fake_otlp_collector().await;
+
+    let addr = free_loopback_addr();
+    let _server = ServerProcess(
+        Command::new(CONCLAVE_BIN)
+            .args(["serve", "--bind", &addr.to_string(), "--ephemeral"])
+            .env("CONCLAVE_OTLP_ENDPOINT", format!("http://{collector_addr}"))
+            .env("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Basic dGVzdC10b2tlbg==")
+            // The startup info event is the log record under test; batch cadence tightened.
+            .env("OTEL_BLRP_SCHEDULE_DELAY", "200")
+            .env("OTEL_BSP_SCHEDULE_DELAY", "200")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn `conclave serve`"),
+    );
+    wait_for_listener(addr).await;
+
+    let head = otlp_hit_for(&mut hit_rx, "/v1/logs").await;
+    assert!(head.starts_with("POST"), "expected an OTLP log POST, got: {head}");
+    assert!(
+        head.to_ascii_lowercase().contains("authorization: basic dgvzdc10b2tlbg=="),
+        "OTEL_EXPORTER_OTLP_HEADERS must reach the collector on the logs path too: {head}"
     );
 }
 

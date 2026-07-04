@@ -16,8 +16,9 @@ primary_region = "sjc"
   # `conclavelib=debug` exports the per-request spans (join/post/read_since/…) to logs and OTLP
   # without SurrealDB's debug noise; drop to plain "info" for lifecycle-only.
   RUST_LOG = "info,conclavelib=debug"
-  # Observability (PRD-0014). `RUST_LOG=debug` adds per-request spans and frame dispatch;
-  # uncomment for structured log pipelines / an OTLP collector (base URL — /v1/traces is appended).
+  # Observability (PRD-0014/0017). `RUST_LOG=debug` adds per-request spans and frame dispatch;
+  # uncomment for structured log pipelines / an OTLP collector (base URL — /v1/traces and
+  # /v1/logs are appended; spans AND log records both export, trace-correlated).
   # Authenticated collectors (Grafana Cloud etc.) take the standard headers env; set BOTH of these
   # as secrets instead so the token stays out of the repo:
   #   fly secrets set CONCLAVE_OTLP_ENDPOINT="https://otlp-gateway-<region>.grafana.net/otlp" \

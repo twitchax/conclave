@@ -74,13 +74,14 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter",
 # `CONCLAVE_OTLP_ENDPOINT` set — no endpoint, no exporter. http-proto + reqwest keeps tonic out.
 opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "logs"] }
 # Direct dep ONLY to switch on reqwest's TLS for the OTLP exporter (feature unification):
 # opentelemetry-http 0.32 asks reqwest for a `webpki-roots` feature that no longer exists in
 # reqwest 0.13, so the exporter's own TLS features are unusable — without this, an https://
 # collector fails with "network error". Platform roots: the runtime image ships ca-certificates.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 tracing-opentelemetry = "0.33.0"
+opentelemetry-appender-tracing = "0.32"
 
 # One-shot CLI verbs restore the default SIGPIPE disposition so `conclave … | head` dies quietly
 # like any Unix CLI instead of panicking on BrokenPipe (PRD-0011 follow-up).

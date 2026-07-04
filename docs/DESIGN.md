@@ -376,8 +376,12 @@ whisper history (ephemeral by decision); **permission levels** (local bridge con
   at warn, per-frame dispatch at debug. Telemetry carries frame *kinds* only — message bodies,
   invite tokens, and key material never reach logs. Env surface: `RUST_LOG` (level),
   `CONCLAVE_LOG_FORMAT=json` (structured stderr for log pipelines), and — `serve` only —
-  `CONCLAVE_OTLP_ENDPOINT=<collector base URL>` lights up OTLP/HTTP trace export (no endpoint,
-  no exporter).
+  `CONCLAVE_OTLP_ENDPOINT=<collector base URL>` lights up OTLP/HTTP export of **both signals**:
+  spans to `/v1/traces` (PRD-0014) and log records to `/v1/logs` (PRD-0017), so a log line
+  carries the trace ID of the request span it fired under. No endpoint, no exporter. `RUST_LOG`
+  gates what exports for logs exactly as for spans, and the exporter stack's own targets
+  (`opentelemetry`/`reqwest`/`hyper`) are excluded from the log bridge so telemetry never feeds
+  itself.
 
 ## 17. Testing
 

@@ -38,9 +38,10 @@ async fn main() {
     let telemetry = init_telemetry(&cli);
 
     let result = execute(&cli).await;
-    // Flush any buffered OTLP spans before the process ends (PRD-0014 T-002).
-    if let Some(provider) = telemetry {
-        let _ = provider.shutdown();
+    // Flush any buffered OTLP spans and log records before the process ends (PRD-0014 T-002).
+    if let Some(providers) = telemetry {
+        let _ = providers.tracer.shutdown();
+        let _ = providers.logger.shutdown();
     }
     if let Err(err) = result {
         error!("❌ {err:#}");
@@ -48,23 +49,30 @@ async fn main() {
     }
 }
 
+/// The OTLP providers `main` must flush on shutdown: spans (PRD-0014) and logs (PRD-0017)
+/// share the endpoint gate and lifecycle but buffer independently.
+struct OtlpProviders {
+    tracer: opentelemetry_sdk::trace::SdkTracerProvider,
+    logger: opentelemetry_sdk::logs::SdkLoggerProvider,
+}
+
 /// Initializes telemetry (PRD-0014): a stderr `fmt` layer — human-pretty, or JSON lines via
-/// `CONCLAVE_LOG_FORMAT=json` for platform log pipelines — plus, for `serve` only, an OTLP trace
-/// exporter when `CONCLAVE_OTLP_ENDPOINT` is set (no endpoint → no exporter task at all).
-/// Returns the tracer provider so `main` can flush it on shutdown.
-fn init_telemetry(cli: &Cli) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+/// `CONCLAVE_LOG_FORMAT=json` for platform log pipelines — plus, for `serve` only, OTLP trace
+/// and log exporters when `CONCLAVE_OTLP_ENDPOINT` is set (no endpoint → no exporter task at
+/// all). Returns the providers so `main` can flush them on shutdown.
+fn init_telemetry(cli: &Cli) -> Option<OtlpProviders> {
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     let directive = log_directive(cli.verbose, std::env::var("RUST_LOG").ok().as_deref());
     let filter = tracing_subscriber::EnvFilter::new(directive);
     let json = std::env::var("CONCLAVE_LOG_FORMAT").is_ok_and(|format| format.eq_ignore_ascii_case("json"));
 
-    let provider = if matches!(cli.command, Command::Serve(_)) {
+    let providers = if matches!(cli.command, Command::Serve(_)) {
         std::env::var("CONCLAVE_OTLP_ENDPOINT")
             .ok()
             .filter(|endpoint| !endpoint.is_empty())
-            .and_then(|endpoint| match otlp_provider(&endpoint) {
-                Ok(provider) => Some(provider),
+            .and_then(|endpoint| match otlp_providers(&endpoint) {
+                Ok(providers) => Some(providers),
                 // A broken exporter must not take the server down — log and serve without it.
                 Err(err) => {
                     eprintln!("⚠ CONCLAVE_OTLP_ENDPOINT is set but the exporter failed to build: {err:#}");
@@ -74,12 +82,20 @@ fn init_telemetry(cli: &Cli) -> Option<opentelemetry_sdk::trace::SdkTracerProvid
     } else {
         None
     };
-    let otel_layer = provider.as_ref().map(|provider| {
+    let otel_layer = providers.as_ref().map(|providers| {
         use opentelemetry::trace::TracerProvider as _;
-        tracing_opentelemetry::layer().with_tracer(provider.tracer("conclave"))
+        tracing_opentelemetry::layer().with_tracer(providers.tracer.tracer("conclave"))
+    });
+    // Events become OTLP log records too (PRD-0017 T-001) — minus the exporter stack's own
+    // targets, or every export POST would emit records that trigger the next export (feedback).
+    let log_bridge = providers.as_ref().map(|providers| {
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&providers.logger).with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            let target = meta.target();
+            !["opentelemetry", "reqwest", "hyper", "h2"].iter().any(|noise| target.starts_with(noise))
+        }))
     });
 
-    let registry = tracing_subscriber::registry().with(filter).with(otel_layer);
+    let registry = tracing_subscriber::registry().with(filter).with(otel_layer).with(log_bridge);
     if json {
         registry.with(tracing_subscriber::fmt::layer().json().with_writer(std::io::stderr).with_target(false)).init();
     } else {
@@ -93,26 +109,40 @@ fn init_telemetry(cli: &Cli) -> Option<opentelemetry_sdk::trace::SdkTracerProvid
             )
             .init();
     }
-    provider
+    providers
 }
 
-/// Builds the OTLP/HTTP span exporter pipeline for `serve` (PRD-0014 T-002). The env var is the
-/// collector *base* URL (e.g. `http://localhost:4318`), matching `OTEL_EXPORTER_OTLP_ENDPOINT`
-/// semantics — the signal path is appended here because an explicit exporter endpoint is
-/// otherwise used verbatim.
-fn otlp_provider(endpoint: &str) -> Res<opentelemetry_sdk::trace::SdkTracerProvider> {
+/// Builds the OTLP/HTTP span and log exporter pipelines for `serve` (PRD-0014 T-002,
+/// PRD-0017 T-001). The env var is the collector *base* URL (e.g. `http://localhost:4318`),
+/// matching `OTEL_EXPORTER_OTLP_ENDPOINT` semantics — the signal paths are appended here
+/// because an explicit exporter endpoint is otherwise used verbatim.
+fn otlp_providers(endpoint: &str) -> Res<OtlpProviders> {
     use opentelemetry_otlp::WithExportConfig as _;
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_endpoint(format!("{}/v1/traces", endpoint.trim_end_matches('/')))
-        .build()
-        .context("failed to build the OTLP span exporter")?;
+    let base = endpoint.trim_end_matches('/');
     let resource = opentelemetry_sdk::Resource::builder()
         .with_service_name("conclave")
         .with_attribute(opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
         .build();
-    Ok(opentelemetry_sdk::trace::SdkTracerProvider::builder().with_batch_exporter(exporter).with_resource(resource).build())
+
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(format!("{base}/v1/traces"))
+        .build()
+        .context("failed to build the OTLP span exporter")?;
+    let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter)
+        .with_resource(resource.clone())
+        .build();
+
+    let log_exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_http()
+        .with_endpoint(format!("{base}/v1/logs"))
+        .build()
+        .context("failed to build the OTLP log exporter")?;
+    let logger = opentelemetry_sdk::logs::SdkLoggerProvider::builder().with_batch_exporter(log_exporter).with_resource(resource).build();
+
+    Ok(OtlpProviders { tracer, logger })
 }
 
 /// Restores the default SIGPIPE disposition (terminate) so pipeline writes end the process quietly.
