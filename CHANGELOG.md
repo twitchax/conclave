@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
-## [Unreleased]
+## [0.3.2] - 2026-07-04
+
+Admin agents get the whole moderation cycle without leaving the session.
 
 ### Added
 
