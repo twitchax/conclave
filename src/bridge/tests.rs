@@ -281,13 +281,18 @@ fn bridge_admin_tools_hidden_until_the_server_marks_admin() {
     for tool in [
         "create_channel",
         "delete_channel",
+        "rename_channel",
         "set_visibility",
         "acl_add",
         "acl_remove",
+        "acl_list",
         "invite_create",
         "invite_revoke",
+        "invite_list",
         "kick",
         "ban",
+        "unban",
+        "ban_list",
     ] {
         assert!(names.contains(&tool), "admin tool `{tool}` must be offered to an admin");
     }
@@ -733,4 +738,108 @@ fn bridge_catch_up_defaults_to_the_live_watermark() {
         ProtocolMessage::ReadSince { since_ms, .. } => assert_eq!(since_ms, 0, "no watermark -> read the full retained window"),
         other => panic!("expected a ReadSince frame, got {other:?}"),
     }
+}
+
+// -----------------------------------------------------------------------------
+// PRD-0016 T-001 — admin-agent parity: audit + moderation tools.
+// -----------------------------------------------------------------------------
+
+/// Reads MCP messages until the tool result for `id` arrives, returning its text.
+fn tool_result_text(rx: &mut mpsc::UnboundedReceiver<Value>, id: i64) -> String {
+    loop {
+        let msg = rx.try_recv().expect("expected a tool result");
+        if msg.get("id") == Some(&json!(id)) {
+            return msg.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default().to_owned();
+        }
+    }
+}
+
+#[test]
+fn bridge_admin_audit_tools_round_trip() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+    harness.core.handle_inbound("s1", ProtocolMessage::ServerInfo { admin: true });
+
+    // unban → the wire op an admin agent previously could not issue (ban without undo).
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(1),
+        name: "unban".to_owned(),
+        args: json!({ "channel": "ops", "user": "bob" }),
+    });
+    assert!(
+        matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Admin(AdminOp::Unban { channel, user }) if channel == "ops" && user == "bob"),
+        "unban must send the Unban admin op"
+    );
+    harness.core.handle_inbound("s1", ProtocolMessage::Ack { detail: Some("bob".to_owned()) });
+    assert_eq!(tool_result_text(&mut harness.to_mcp_rx, 1), "bob");
+
+    // acl_list → rendered UserList.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(2),
+        name: "acl_list".to_owned(),
+        args: json!({ "channel": "ops" }),
+    });
+    assert!(matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Admin(AdminOp::AclList { channel }) if channel == "ops"));
+    harness.core.handle_inbound(
+        "s1",
+        ProtocolMessage::UserList {
+            users: vec!["aaron".to_owned(), "david".to_owned()],
+        },
+    );
+    let text = tool_result_text(&mut harness.to_mcp_rx, 2);
+    assert!(text.contains("aaron") && text.contains("david"), "acl_list must render the member list: {text}");
+
+    // ban_list → rendered UserList.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(3),
+        name: "ban_list".to_owned(),
+        args: json!({ "channel": "ops" }),
+    });
+    assert!(matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Admin(AdminOp::BanList { channel }) if channel == "ops"));
+    harness.core.handle_inbound("s1", ProtocolMessage::UserList { users: vec!["mallory".to_owned()] });
+    assert!(tool_result_text(&mut harness.to_mcp_rx, 3).contains("mallory"));
+
+    // invite_list → rendered InviteList with token + uses.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(4),
+        name: "invite_list".to_owned(),
+        args: json!({ "channel": "ops" }),
+    });
+    assert!(matches!(harness.to_server_rx.try_recv().unwrap(), ProtocolMessage::Admin(AdminOp::InviteList { channel }) if channel == "ops"));
+    harness.core.handle_inbound(
+        "s1",
+        ProtocolMessage::InviteList {
+            invites: vec![crate::protocol::InviteInfo {
+                token: "tok-1".to_owned(),
+                uses_remaining: Some(2),
+                expires_at: None,
+            }],
+        },
+    );
+    let text = tool_result_text(&mut harness.to_mcp_rx, 4);
+    assert!(text.contains("tok-1") && text.contains('2'), "invite_list must render tokens with uses: {text}");
+
+    // rename_channel → the one channel-shape verb the bridge lacked.
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(5),
+        name: "rename_channel".to_owned(),
+        args: json!({ "name": "ops", "new_name": "ops2" }),
+    });
+    assert!(matches!(
+        harness.to_server_rx.try_recv().unwrap(),
+        ProtocolMessage::Admin(AdminOp::RenameChannel { name, new_name }) if name == "ops" && new_name == "ops2"
+    ));
+}
+
+#[test]
+fn bridge_admin_audit_tools_refused_for_non_admins() {
+    let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
+
+    harness.core.handle_mcp(FromMcp::CallTool {
+        id: json!(9),
+        name: "unban".to_owned(),
+        args: json!({ "channel": "ops", "user": "bob" }),
+    });
+    let text = tool_result_text(&mut harness.to_mcp_rx, 9);
+    assert!(text.contains("not an admin"), "non-admin unban must be refused locally: {text}");
+    assert!(harness.to_server_rx.try_recv().is_err(), "no frame may reach the server for a refused admin op");
 }

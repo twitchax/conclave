@@ -96,8 +96,10 @@ reachable with this machine's key, and the resolved permission table.
   arrive as `<channel kind="permission_request">` tags and routinely **echo back for the session's
   own tool calls**; assume the user already knows to ignore that noise — don't narrate or flag each
   echo, just carry on.
-- **Admin tools** (`create_channel`, `delete_channel`, `set_visibility`, `acl_add`, `acl_remove`,
-  `invite_create`, `invite_revoke`, `kick`, `ban`) appear **only when you are a server admin**.
+- **Admin tools** (`create_channel`, `delete_channel`, `rename_channel`, `set_visibility`,
+  `acl_add`, `acl_remove`, `acl_list`, `invite_create`, `invite_revoke`, `invite_list`, `kick`,
+  `ban`, `unban`, `ban_list`) appear **only when you are a server admin** — the full moderation
+  cycle, including the audit reads, without leaving the session.
 
 Pass `server` only when connected to more than one; otherwise it defaults to the sole connection.
 

@@ -290,9 +290,14 @@ impl BridgeCore {
             "set_perm" => self.tool_set_perm(id, args),
             "create_channel" => self.tool_create_channel(id, args),
             "delete_channel" => self.tool_delete_channel(id, args),
+            "rename_channel" => self.tool_rename_channel(id, args),
             "set_visibility" => self.tool_set_visibility(id, args),
             "acl_add" => self.tool_acl(id, args, true),
             "acl_remove" => self.tool_acl(id, args, false),
+            "acl_list" => self.tool_channel_audit(id, args, |channel| AdminOp::AclList { channel }),
+            "ban_list" => self.tool_channel_audit(id, args, |channel| AdminOp::BanList { channel }),
+            "invite_list" => self.tool_channel_audit(id, args, |channel| AdminOp::InviteList { channel }),
+            "unban" => self.tool_unban(id, args),
             "invite_create" => self.tool_invite_create(id, args),
             "invite_revoke" => self.tool_invite_revoke(id, args),
             "kick" => self.tool_kick(id, args),
@@ -421,6 +426,57 @@ impl BridgeCore {
             AdminOp::Kick {
                 channel: channel.to_owned(),
                 target: target.to_owned(),
+            },
+        );
+    }
+
+    /// One handler for the channel-scoped audit reads (PRD-0016): `acl_list` / `ban_list` /
+    /// `invite_list` differ only in the admin op they defer.
+    fn tool_channel_audit(&mut self, id: &Value, args: &Value, op: fn(String) -> AdminOp) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let Some(channel) = arg_str(args, "channel") else {
+            return self.send_mcp(mcp::tool_error_result(id, "`channel` is required"));
+        };
+        self.defer_admin(id, &server, op(channel.to_owned()));
+    }
+
+    /// Lifts a ban without granting ACL membership (PRD-0016 — an admin agent could previously
+    /// ban but not undo it).
+    fn tool_unban(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let (Some(channel), Some(user)) = (arg_str(args, "channel"), arg_str(args, "user")) else {
+            return self.send_mcp(mcp::tool_error_result(id, "`channel` and `user` are required"));
+        };
+        self.defer_admin(
+            id,
+            &server,
+            AdminOp::Unban {
+                channel: channel.to_owned(),
+                user: user.to_owned(),
+            },
+        );
+    }
+
+    fn tool_rename_channel(&mut self, id: &Value, args: &Value) {
+        let server = match self.resolve_server(id, args) {
+            Ok(server) => server,
+            Err(error) => return self.send_mcp(error),
+        };
+        let (Some(name), Some(new_name)) = (arg_str(args, "name"), arg_str(args, "new_name")) else {
+            return self.send_mcp(mcp::tool_error_result(id, "`name` and `new_name` are required"));
+        };
+        self.defer_admin(
+            id,
+            &server,
+            AdminOp::RenameChannel {
+                name: name.to_owned(),
+                new_name: new_name.to_owned(),
             },
         );
     }
@@ -649,6 +705,12 @@ impl BridgeCore {
             ProtocolMessage::Presence { channel, sessions } => self.resolve_pending(server, &format_presence(channel.as_deref(), &sessions)),
             ProtocolMessage::Ack { detail } => self.resolve_pending(server, detail.as_deref().unwrap_or("ok")),
             ProtocolMessage::InviteToken { token } => self.resolve_pending(server, &format!("invite token: {token}")),
+            // Audit-read responses (PRD-0016): member/ban lists and outstanding invites.
+            ProtocolMessage::UserList { users } => {
+                let text = if users.is_empty() { "nobody".to_owned() } else { users.join(", ") };
+                self.resolve_pending(server, &text);
+            }
+            ProtocolMessage::InviteList { invites } => self.resolve_pending(server, &format_invites(&invites)),
             // A retained-history page (PRD-0013): advance the watermark to the newest row, then
             // resolve the deferred catch_up call with the rendered page.
             ProtocolMessage::History { channel, messages } => {
@@ -909,6 +971,22 @@ fn format_presence(channel: Option<&str>, sessions: &[SessionPath]) -> String {
     format!("{scope}: {who}")
 }
 
+/// Renders a channel's outstanding invites (PRD-0016 `invite_list`).
+fn format_invites(invites: &[crate::protocol::InviteInfo]) -> String {
+    if invites.is_empty() {
+        return "no outstanding invites".to_owned();
+    }
+    invites
+        .iter()
+        .map(|invite| {
+            let uses = invite.uses_remaining.map_or_else(|| "unlimited".to_owned(), |n| n.to_string());
+            let expires = invite.expires_at.as_deref().unwrap_or("never");
+            format!("{} (uses remaining: {uses}, expires: {expires})", invite.token)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Renders one retained-history page as a `catch_up` tool result: attributed, timestamped, and
 /// framed as untrusted quoted content (PRD-0013 T-003).
 fn format_history(channel: &str, messages: &[crate::protocol::HistoryMessage]) -> String {
@@ -1131,6 +1209,31 @@ fn admin_tools() -> Vec<Tool> {
             name: "ban",
             description: "Admin: ban a user from a channel (drops them and blocks rejoin).",
             input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" }, "user": { "type": "string" } }, "required": ["channel", "user"] }),
+        },
+        Tool {
+            name: "unban",
+            description: "Admin: lift a channel ban without granting ACL membership.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" }, "user": { "type": "string" } }, "required": ["channel", "user"] }),
+        },
+        Tool {
+            name: "rename_channel",
+            description: "Admin: rename a channel (members, history, invites, and bans follow it).",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "name": { "type": "string" }, "new_name": { "type": "string" } }, "required": ["name", "new_name"] }),
+        },
+        Tool {
+            name: "acl_list",
+            description: "Admin: list a channel's ACL members.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" } }, "required": ["channel"] }),
+        },
+        Tool {
+            name: "ban_list",
+            description: "Admin: list a channel's banned users.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" } }, "required": ["channel"] }),
+        },
+        Tool {
+            name: "invite_list",
+            description: "Admin: list a channel's outstanding invite tokens with uses/expiry.",
+            input_schema: json!({ "type": "object", "properties": { "server": server, "channel": { "type": "string" } }, "required": ["channel"] }),
         },
     ]
 }

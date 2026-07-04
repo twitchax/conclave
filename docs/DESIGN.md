@@ -301,6 +301,23 @@ framing **and** the permission-relay (§12) — conclave does not control them d
    offline** until you join), and joining calls the running bridge's `join_channel` tool to connect +
    subscribe (optionally with `--perm`) — it does **not** launch the bridge.
 
+### Two surfaces, one doctrine (PRD-0016)
+
+The MCP toolset and the CLI overlap deliberately, not accidentally. The rule for sorting any new
+verb: **parity where both audiences legitimately act; deliberate asymmetry where the audience or
+trust model differs.**
+
+- The **bridge tools are the governed in-session surface**: emit is offered only at `converse`+,
+  admin tools only with the server role, permission prompts relay through `submit_permission`.
+  An agent shelling out to the CLI bypasses that governance — in-session actions belong in tools.
+- The **CLI is the human/operator surface**: `serve`, watching (`tail`, `status`), scripting, and
+  everything identity-shaped.
+- **Identity and enrollment are CLI-only by design** (`key`, `register`, `machine`, `server`): the
+  lost-laptop kill switch must require human hands — a prompt-injected agent must never be able to
+  enroll or revoke keys. Server-wide user administration (`user list/remove`) stays human too.
+- Messaging, presence, channel administration, and moderation audit have full parity; `catch_up`
+  (agent) pairs with `tail --since` (human).
+
 ## 14. Data flow
 
 - **Inbound** (peer → your agent): sender's bridge → WS → central → fan-out to subscribed sessions'

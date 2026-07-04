@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [Unreleased]
+
+### Added
+
+- **Admin-agent parity (PRD-0016).** The bridge's gated admin toolset gains `unban`,
+  `rename_channel`, `acl_list`, `ban_list`, and `invite_list` — an admin agent could previously
+  `ban` but not undo or even see it without shelling out to the CLI (which bypasses the governed
+  tool surface). DESIGN now records the two-surfaces doctrine: parity where both audiences act;
+  identity/enrollment stays CLI-only so a prompt-injected agent can never touch keys.
+
 ## [0.3.1] - 2026-07-03
 
 The observability release: the server finally narrates itself.
