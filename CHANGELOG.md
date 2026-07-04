@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [0.3.4] - 2026-07-04
+
+### Added
+
+- **OTLP logs export (PRD-0017).** `CONCLAVE_OTLP_ENDPOINT` now lights up both signals: tracing
+  events export as OTLP log records to `<base>/v1/logs` alongside the spans, stamped with the
+  owning span's trace ID — so Grafana can pivot from a log line to its trace and back. The
+  exporter stack's own targets are excluded from the bridge (telemetry never feeds itself), and
+  `RUST_LOG` gates what exports for logs exactly as for spans. `fly logs` is unchanged.
+
 ## [0.3.3] - 2026-07-04
 
 ### Fixed
