@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [0.3.6] - 2026-07-05
+
+### Changed
+
+- **The skill now recommends local-scoped MCP registration.** `claude mcp add --scope local`
+  (per project) replaces the old `--scope user` guidance: a registered bridge spawns and holds a
+  live server connection in every session it loads in — the channels flag only gates inbound
+  injection, not the bridge itself — so user scope made every project on the machine pay that
+  cost invisibly. Opt directories in deliberately; the onboarding test now pins the local-scope
+  form and rejects any user-scope recommendation.
+
 ## [0.3.5] - 2026-07-05
 
 ### Fixed
