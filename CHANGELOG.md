@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [0.3.5] - 2026-07-05
+
+### Fixed
+
+- **Same-directory sessions no longer fight over one handle (PRD-0018).** Bridges launch from
+  shared user-scoped MCP config, so a fleet of sessions in one project directory all defaulted
+  to the same handle and superseded each other in an endless polite rotation (observed live:
+  six sessions, one handle, 10+ hours). A *defaulted* handle now renames itself (`dir-2`,
+  `-3`, ...) when the collision breaker trips, reconnects under the new name, and announces it —
+  the fight ends on its own. An explicit `--as` is never auto-renamed; it keeps the advisory
+  diagnosis. Client-side only, no wire change.
+
 ## [0.3.4] - 2026-07-04
 
 ### Added
