@@ -927,11 +927,16 @@ async fn e2e_join_skill_join_with_perm_connects_subscribes_and_emits() {
     );
     // The first-time flow must be walkable by an agent: MCP registration, the channels research-
     // preview gate (by registered server name), and the shared-handle (--as) footgun warning.
-    // The recommended registration is a *bare* `conclave bridge` (connects to every registered
-    // server) — no `--server` baked into the MCP command.
+    // The recommended registration is *local-scoped* (per project — a user-scoped bridge spawns
+    // and connects in every session on the machine) and *bare* `conclave bridge` (connects to
+    // every registered server) — no `--server` baked into the MCP command.
     assert!(
-        skill_text.contains("claude mcp add --scope user conclave -- conclave bridge\n"),
-        "skill must recommend registering the bridge bare (no --server pinned)"
+        skill_text.contains("claude mcp add --scope local conclave -- conclave bridge\n"),
+        "skill must recommend a local-scoped, bare bridge registration (no --server pinned)"
+    );
+    assert!(
+        !skill_text.contains("mcp add --scope user conclave"),
+        "skill must not recommend user scope — every session would spawn a connecting bridge"
     );
     assert!(
         skill_text.contains("--dangerously-load-development-channels server:conclave"),

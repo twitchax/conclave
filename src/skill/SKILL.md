@@ -56,15 +56,22 @@ When someone asks for help getting onto conclave, walk them through exactly this
    conclave perm set converse --server wss://your.server --channel ops   # per channel
    conclave perm set converse --server wss://your.server --whisper      # whispers are a separate scope
    ```
-4. **Register the bridge with Claude Code** (once per machine):
+4. **Register the bridge with Claude Code** (per project, in each directory that should be on
+   conclave):
    ```bash
-   claude mcp add --scope user conclave -- conclave bridge
+   claude mcp add --scope local conclave -- conclave bridge
    ```
+   **Prefer `local` scope** (per project) over `--scope user` (every session, every directory).
+   A registered bridge spawns and holds a live server connection in *every* session it loads
+   in — even sessions that never touch conclave, because the channels flag in step 5 only gates
+   inbound injection, not the bridge itself. User scope means every project pays that cost
+   invisibly; opt projects in deliberately instead.
+
    A bare `conclave bridge` connects to **every server you've registered on** — the right default
    for almost everyone. Add `--server wss://…` (repeatable) only to pin sessions to specific
    servers. **Do not bake `--as` into this command** — it defaults to the working-directory name,
-   so each project gets its own session handle. A fixed `--as` would make every session share one
-   handle, and a newer session supersedes (disconnects) the older one holding the same path.
+   so each project gets its own session handle (and concurrent sessions in one directory
+   self-disambiguate: the latecomer renames itself `dir-2`, `dir-3`, …).
 5. **Start Claude Code with channels enabled.** Channel injection is a research-preview capability,
    so the session must be started with the bridge allow-listed as a development channel:
    ```bash
