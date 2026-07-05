@@ -735,6 +735,15 @@ impl Bridge {
         Self::from_command(command)
     }
 
+    /// Spawns a bridge with no `--as`, so the handle defaults from `cwd` — the shared-MCP-config
+    /// shape that collides when several sessions run in one project directory (PRD-0018).
+    fn spawn_defaulted(config_dir: &Path, url: &str, cwd: &Path) -> Self {
+        let mut command = tokio::process::Command::new(CONCLAVE_BIN);
+        command.args(["bridge", "--config-dir", config_dir.to_str().unwrap(), "--server", url]);
+        command.current_dir(cwd);
+        Self::from_command(command)
+    }
+
     fn from_command(mut command: tokio::process::Command) -> Self {
         let mut child = command
             .stdin(Stdio::piped())
@@ -1171,4 +1180,53 @@ async fn e2e_bridge_disables_a_duplicate_url_for_the_same_server() {
     let who = bridge.call(1, "who", json!({})).await;
     let text = who.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
     assert_eq!(text.matches("aaron/workstation/sess").count(), 1, "exactly one live session expected: {text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_bridge_collision_renames_the_defaulted_latecomer() {
+    // TWO bridges, one working directory, no --as — the shared-MCP-config fleet shape behind the
+    // live production storm (PRD-0018). The fight must end with one bridge renamed and both live.
+    let addr = free_loopback_addr();
+    let url = format!("ws://{addr}/");
+    let server_dir = TempDir::new().unwrap();
+    let _server = spawn_server(addr, server_dir.path(), &[]);
+    wait_for_listener(addr).await;
+
+    let config = TempDir::new().unwrap();
+    let identity = Identity::generate().unwrap();
+    provision(config.path(), &identity, &url, "aaron", "workstation", PermissionLevel::Notify);
+    {
+        let mut ws = ws_connect(addr).await;
+        ws_register(&mut ws, &identity, "aaron", "workstation", "setup").await;
+    }
+
+    // A shared cwd with a stable name, so both defaulted handles are `fleet`.
+    let scratch = TempDir::new().unwrap();
+    let workdir = scratch.path().join("fleet");
+    std::fs::create_dir(&workdir).unwrap();
+
+    let mut first = Bridge::spawn_defaulted(config.path(), &url, &workdir);
+    first.initialize().await;
+    let mut second = Bridge::spawn_defaulted(config.path(), &url, &workdir);
+    second.initialize().await;
+
+    // Either bridge may be the one that trips the breaker and renames; poll presence until two
+    // distinct `fleet*` sessions are live at once. The rename rides the reconnect backoff, so
+    // the deadline is generous; a poll landing mid-fight (link down → tool error) just retries.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
+    let mut id = 100;
+    let settled = loop {
+        if tokio::time::Instant::now() >= deadline {
+            break String::new();
+        }
+        id += 1;
+        let who = first.call(id, "who", json!({})).await;
+        let text = who.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
+        if text.matches("aaron/workstation/fleet").count() == 2 && text.contains("aaron/workstation/fleet-2") {
+            break text.to_owned();
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    assert!(!settled.is_empty(), "the collision never settled into two distinct live handles");
+    drop(second);
 }

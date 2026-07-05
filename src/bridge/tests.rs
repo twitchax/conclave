@@ -14,7 +14,7 @@ use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use super::{BridgeCore, client, mcp::FromMcp, mcp::McpSink};
+use super::{BridgeCore, SessionHandle, client, mcp::FromMcp, mcp::McpSink};
 use crate::{
     base::{PermissionLevel, SessionPath, Visibility},
     identity::{Config, PermissionOverride, ServerRegistration},
@@ -36,6 +36,7 @@ impl NotificationSink for CapturingSink {
 
 struct Harness {
     core: BridgeCore,
+    session: SessionHandle,
     to_mcp_rx: mpsc::UnboundedReceiver<Value>,
     to_server_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     injections: Arc<Mutex<Vec<Injection>>>,
@@ -59,10 +60,15 @@ fn override_for(server: &str, channel: Option<&str>, level: PermissionLevel) -> 
 }
 
 fn harness(config: Config) -> Harness {
+    // Explicit by default: most tests are about behavior other than handle disambiguation.
+    harness_with_session(config, SessionHandle::explicit("razel".to_owned()))
+}
+
+fn harness_with_session(config: Config, session: SessionHandle) -> Harness {
     let (to_mcp_tx, to_mcp_rx) = mpsc::unbounded_channel();
     let injections = Arc::new(Mutex::new(Vec::new()));
     let sink = Box::new(CapturingSink { injections: Arc::clone(&injections) });
-    let mut core = BridgeCore::new(config, "razel".to_owned(), to_mcp_tx, sink);
+    let mut core = BridgeCore::new(config, session.clone(), to_mcp_tx, sink);
 
     let (to_server_tx, to_server_rx) = mpsc::unbounded_channel();
     let joined = Arc::new(Mutex::new(HashSet::new()));
@@ -78,6 +84,7 @@ fn harness(config: Config) -> Harness {
 
     Harness {
         core,
+        session,
         to_mcp_rx,
         to_server_rx,
         injections,
@@ -132,7 +139,7 @@ fn bridge_inject_delivers_a_notifications_claude_channel_frame() {
     // With the real MCP sink, an inbound message becomes a `notifications/claude/channel`.
     let (to_mcp_tx, mut to_mcp_rx) = mpsc::unbounded_channel();
     let sink = Box::new(McpSink::new(to_mcp_tx.clone()));
-    let mut core = BridgeCore::new(make_config(PermissionLevel::Notify, vec![]), "razel".to_owned(), to_mcp_tx, sink);
+    let mut core = BridgeCore::new(make_config(PermissionLevel::Notify, vec![]), SessionHandle::explicit("razel".to_owned()), to_mcp_tx, sink);
     core.register_server(
         ServerRegistration {
             url: "s1".to_owned(),
@@ -649,6 +656,37 @@ async fn bridge_link_flapping_diagnoses_a_handle_conflict_and_quiets_down() {
     harness.core.handle_link_event("s1", client::LinkEvent::Down);
     let texts = drain_notice_texts(&mut harness.to_mcp_rx);
     assert!(texts.iter().any(|t| t.contains("Disconnected")), "a stable link resets the breaker: {texts:?}");
+}
+
+// -----------------------------------------------------------------------------
+// PRD-0018 T-001 — defaulted handles self-disambiguate on a diagnosed collision.
+// -----------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn bridge_link_flapping_renames_a_defaulted_handle() {
+    let mut harness = harness_with_session(make_config(PermissionLevel::Notify, vec![]), SessionHandle::defaulted("razel".to_owned()));
+
+    // Three instant drops: the breaker trips and, because the handle was defaulted (no --as),
+    // the bridge renames itself instead of only advising.
+    for _ in 0..3 {
+        harness.core.handle_link_event("s1", client::LinkEvent::Up);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        harness.core.handle_link_event("s1", client::LinkEvent::Down);
+    }
+    let texts = drain_notice_texts(&mut harness.to_mcp_rx);
+    assert!(texts.iter().any(|t| t.contains("razel-2")), "the tripped breaker must announce the renamed handle: {texts:?}");
+    assert_eq!(harness.session.get(), "razel-2", "the shared handle must carry the new name for the next dial");
+
+    // If the renamed handle *also* fights (a fleet racing for suffixes), the re-armed breaker
+    // bumps again.
+    for _ in 0..3 {
+        harness.core.handle_link_event("s1", client::LinkEvent::Up);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        harness.core.handle_link_event("s1", client::LinkEvent::Down);
+    }
+    let texts = drain_notice_texts(&mut harness.to_mcp_rx);
+    assert!(texts.iter().any(|t| t.contains("razel-3")), "a still-fighting renamed handle must bump again: {texts:?}");
+    assert_eq!(harness.session.get(), "razel-3");
 }
 
 // -----------------------------------------------------------------------------

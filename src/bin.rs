@@ -619,8 +619,10 @@ async fn run_bridge(explicit: Option<&PathBuf>, args: &BridgeArgs) -> Void {
     let identity = identity::load_identity(&dir)?;
     let config = identity::load_config(&dir)?;
     let session = match &args.session {
-        Some(session) => session.clone(),
-        None => identity::default_handle(&std::env::current_dir().context("failed to read the working directory")?),
+        // An explicit `--as` pins the name; a defaulted handle self-disambiguates on collision
+        // (PRD-0018) — same-directory sessions are the normal case, not the anomaly.
+        Some(session) => conclavelib::bridge::SessionHandle::explicit(session.clone()),
+        None => conclavelib::bridge::SessionHandle::defaulted(identity::default_handle(&std::env::current_dir().context("failed to read the working directory")?)),
     };
     conclavelib::bridge::run(conclavelib::bridge::BridgeSetup {
         identity,

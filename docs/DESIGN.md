@@ -361,6 +361,13 @@ whisper history (ephemeral by decision); **permission levels** (local bridge con
   half-open connections (§10). The backoff resets only after a link stays up for a stability
   window — a successful connect that is killed immediately (a supersede fight) keeps backing off
   (PRD-0012).
+- **Handle collisions self-heal (PRD-0018).** When the flapping breaker (PRD-0015) diagnoses a
+  supersede fight, a handle *defaulted* from the directory name renames itself (`dir-2`, `-3`, …),
+  re-arms the breaker, and reconnects under the new name — same-directory fleets settle into
+  distinct handles without operator action (bridges launch from shared user-scoped MCP config, so
+  "pass a different `--as`" is not actionable for them). An explicit `--as` is never auto-renamed:
+  the collision is diagnosed and the choice stays with the user. Naming is entirely client-side —
+  no wire change, and old servers referee the supersede exactly as before.
 - **Bridge process death** (crash) loses in-memory join state — only connection-drops auto-resubscribe;
   a fresh process needs a re-`/join`.
 - Auth failure (unknown/revoked key, taken username, handle collision) → clear CLI/CC error.

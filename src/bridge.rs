@@ -51,6 +51,63 @@ const RAPID_DROP_DIAGNOSIS_THRESHOLD: u32 = 3;
 /// latency (PRD-0013 T-003) — a duplicated message beats a silently-missed one.
 const CATCH_UP_SLACK_MS: i64 = 60_000;
 
+/// The live session handle, shared between the dispatcher and every link's connect closure: the
+/// dispatcher may rename a *defaulted* handle when the collision breaker trips (PRD-0018), and
+/// each reconnect dials with the current value.
+#[derive(Clone)]
+pub struct SessionHandle {
+    /// The name renames derive from (`base-2`, `base-3`, …) — never mutated.
+    base: String,
+    /// An explicit `--as` is a deliberate choice — never auto-renamed.
+    explicit: bool,
+    state: Arc<Mutex<HandleState>>,
+}
+
+struct HandleState {
+    current: String,
+    generation: u32,
+}
+
+impl SessionHandle {
+    /// A handle the user chose with `--as`: collisions are diagnosed but never auto-renamed.
+    #[must_use]
+    pub fn explicit(handle: String) -> Self {
+        Self::new(handle, true)
+    }
+
+    /// A handle defaulted from the working directory: collisions self-disambiguate (PRD-0018).
+    #[must_use]
+    pub fn defaulted(handle: String) -> Self {
+        Self::new(handle, false)
+    }
+
+    fn new(handle: String, explicit: bool) -> Self {
+        Self {
+            base: handle.clone(),
+            explicit,
+            state: Arc::new(Mutex::new(HandleState { current: handle, generation: 1 })),
+        }
+    }
+
+    /// The handle to dial with right now.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle mutex was poisoned (a prior panic mid-rename; unrecoverable).
+    #[must_use]
+    pub fn get(&self) -> String {
+        self.state.lock().expect("session handle mutex poisoned").current.clone()
+    }
+
+    /// Renames to the next disambiguated handle (`base-2`, `base-3`, …) and returns it.
+    fn bump(&self) -> String {
+        let mut state = self.state.lock().expect("session handle mutex poisoned");
+        state.generation += 1;
+        state.current = format!("{}-{}", self.base, state.generation);
+        state.current.clone()
+    }
+}
+
 /// Everything the running bridge needs: this machine's key, the local config, the session handle,
 /// and (optionally) a subset of configured servers to connect to.
 pub struct BridgeSetup {
@@ -58,8 +115,8 @@ pub struct BridgeSetup {
     pub identity: Identity,
     /// The local config: permission policy + known-server registrations (M1).
     pub config: Config,
-    /// The live-session handle (`--as`, default = repo/dir name).
-    pub session: String,
+    /// The live-session handle (`--as` = explicit, else defaulted from the directory name).
+    pub session: SessionHandle,
     /// A subset of `config.servers` URLs to connect to; empty means all of them.
     pub servers: Vec<String>,
 }
@@ -98,7 +155,9 @@ pub async fn run(setup: BridgeSetup) -> Void {
         let connect = move || {
             let identity = Arc::clone(&identity);
             let url = url.clone();
-            let session = session.clone();
+            // Read the *current* handle each attempt — a collision rename (PRD-0018) must take
+            // effect on the next dial, not the next process.
+            let session = session.get();
             let claims = Arc::clone(&claims);
             async move { client::connect_ws(&url, &identity, &session, &claims).await }
         };
@@ -159,7 +218,7 @@ enum Pending {
 /// injections / outbound frames out. Everything I/O lives in [`run`]; this is unit-testable.
 struct BridgeCore {
     config: Config,
-    session: String,
+    session: SessionHandle,
     to_mcp: mpsc::UnboundedSender<Value>,
     sink: Box<dyn NotificationSink>,
     servers: HashMap<String, ServerHandle>,
@@ -182,7 +241,7 @@ struct BridgeCore {
 }
 
 impl BridgeCore {
-    fn new(config: Config, session: String, to_mcp: mpsc::UnboundedSender<Value>, sink: Box<dyn NotificationSink>) -> Self {
+    fn new(config: Config, session: SessionHandle, to_mcp: mpsc::UnboundedSender<Value>, sink: Box<dyn NotificationSink>) -> Self {
         Self {
             config,
             session,
@@ -820,13 +879,28 @@ impl BridgeCore {
                 *count
             };
             if drops == RAPID_DROP_DIAGNOSIS_THRESHOLD {
+                if self.session.explicit {
+                    self.notify(
+                        server,
+                        "link",
+                        &format!(
+                            "The link to `{server}` keeps dropping right after connecting — if another live session is using the handle `{session}`, the two supersede each other; start one with a distinct `--as`. Going quiet until the link stabilizes.",
+                            session = self.session.get()
+                        ),
+                    );
+                    return;
+                }
+                // A defaulted handle self-disambiguates (PRD-0018): rename, re-arm the breaker
+                // (a fleet racing for suffixes just bumps again), and let the next dial use the
+                // new name. In-flight dials with the old name may burn a drop or two first —
+                // suffixes can skip, but every fight ends.
+                let held = self.session.get();
+                let renamed = self.session.bump();
+                self.rapid_drops.remove(server);
                 self.notify(
                     server,
                     "link",
-                    &format!(
-                        "The link to `{server}` keeps dropping right after connecting — if another live session is using the handle `{session}`, the two supersede each other; start one with a distinct `--as`. Going quiet until the link stabilizes.",
-                        session = self.session
-                    ),
+                    &format!("Another live session holds the handle `{held}` — reconnecting to `{server}` as `{renamed}` (pass `--as` to pin a name)."),
                 );
                 return;
             }
@@ -920,8 +994,8 @@ impl BridgeCore {
 
     fn our_path(&self, server: &str) -> SessionPath {
         self.servers.get(server).map_or_else(
-            || SessionPath::new("unknown", "unknown", self.session.clone()),
-            |handle| SessionPath::new(handle.registration.username.clone(), handle.registration.machine.clone(), self.session.clone()),
+            || SessionPath::new("unknown", "unknown", self.session.get()),
+            |handle| SessionPath::new(handle.registration.username.clone(), handle.registration.machine.clone(), self.session.get()),
         )
     }
 

@@ -21,10 +21,12 @@ skill is the complete guide to driving it.
   (each its own key). A *session* is one live connection with a handle (`--as`, default = the
   working-directory name). Every message's sender is a full path, e.g. `aaron/workstation/razel`.
 - **Every Claude Code session runs its own bridge process** (the MCP registration spawns one per
-  session), so one machine routinely has several. Handles must be unique per live session: two
-  concurrent sessions in the *same directory* collide on the default handle and supersede each
-  other — the bridge diagnoses this ("keeps dropping right after connecting") and the fix is to
-  give one session a distinct `--as`.
+  session), so one machine routinely has several. Handles must be unique per live session, and
+  *defaulted* handles self-disambiguate: when concurrent sessions in the same directory collide,
+  the latecomer renames itself (`dir-2`, `dir-3`, …), reconnects, and announces its new handle —
+  a fleet in one project settles into distinct names on its own. An explicit `--as` pins a name
+  and is never auto-renamed; if it collides, the bridge only diagnoses the fight ("keeps dropping
+  right after connecting").
 - **Channels** have a visibility tier: **public** (discoverable), **unlisted** (joinable if you know
   the name), **private** (ACL / invite only). A **whisper** is a direct message to exactly one
   session path.
