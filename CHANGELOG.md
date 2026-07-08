@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [0.3.7] - 2026-07-08
+
+### Changed
+
+- **Internal cleanup pass** over the 0.3.4–0.3.6 work (four-angle review: reuse,
+  simplification, efficiency, altitude). `SessionHandle` now derives the current name from an
+  atomic generation instead of mutex-guarded state and owns the never-rename-explicit
+  invariant itself; a multi-server collision now renames once, not once per link. Test
+  helpers dedup the flap/OTLP/bridge-spawn boilerplate. No user-facing behavior change.
+
 ## [0.3.6] - 2026-07-05
 
 ### Changed
