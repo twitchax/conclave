@@ -91,7 +91,7 @@ fn init_telemetry(cli: &Cli) -> Option<OtlpProviders> {
     let log_bridge = providers.as_ref().map(|providers| {
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&providers.logger).with_filter(tracing_subscriber::filter::filter_fn(|meta| {
             let target = meta.target();
-            !["opentelemetry", "reqwest", "hyper", "h2"].iter().any(|noise| target.starts_with(noise))
+            !OTLP_LOG_NOISE_TARGETS.iter().any(|noise| target.starts_with(noise))
         }))
     });
 
@@ -111,6 +111,13 @@ fn init_telemetry(cli: &Cli) -> Option<OtlpProviders> {
     }
     providers
 }
+
+/// Target prefixes excluded from the OTLP log bridge (PRD-0017): the opentelemetry crates plus
+/// the transport stack behind [`otlp_providers`]' `.with_http()` choice (reqwest → hyper/h2).
+/// Bridging their events would emit log records *during* an export POST, each triggering the
+/// next export — a feedback loop. If the exporter transport ever changes (e.g. to tonic/gRPC),
+/// this list must change with it.
+const OTLP_LOG_NOISE_TARGETS: [&str; 4] = ["opentelemetry", "reqwest", "hyper", "h2"];
 
 /// Builds the OTLP/HTTP span and log exporter pipelines for `serve` (PRD-0014 T-002,
 /// PRD-0017 T-001). The env var is the collector *base* URL (e.g. `http://localhost:4318`),

@@ -21,7 +21,10 @@ mod sink;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
@@ -60,12 +63,8 @@ pub struct SessionHandle {
     base: String,
     /// An explicit `--as` is a deliberate choice — never auto-renamed.
     explicit: bool,
-    state: Arc<Mutex<HandleState>>,
-}
-
-struct HandleState {
-    current: String,
-    generation: u32,
+    /// Disambiguation generation: 1 renders the bare `base`, n ≥ 2 renders `base-n`.
+    generation: Arc<AtomicU32>,
 }
 
 impl SessionHandle {
@@ -81,30 +80,39 @@ impl SessionHandle {
         Self::new(handle, false)
     }
 
-    fn new(handle: String, explicit: bool) -> Self {
+    fn new(base: String, explicit: bool) -> Self {
         Self {
-            base: handle.clone(),
+            base,
             explicit,
-            state: Arc::new(Mutex::new(HandleState { current: handle, generation: 1 })),
+            generation: Arc::new(AtomicU32::new(1)),
         }
     }
 
     /// The handle to dial with right now.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the handle mutex was poisoned (a prior panic mid-rename; unrecoverable).
     #[must_use]
     pub fn get(&self) -> String {
-        self.state.lock().expect("session handle mutex poisoned").current.clone()
+        self.name_at(self.generation.load(Ordering::Relaxed))
     }
 
-    /// Renames to the next disambiguated handle (`base-2`, `base-3`, …) and returns it.
-    fn bump(&self) -> String {
-        let mut state = self.state.lock().expect("session handle mutex poisoned");
-        state.generation += 1;
-        state.current = format!("{}-{}", self.base, state.generation);
-        state.current.clone()
+    /// Renames to the next disambiguated handle and returns it — or `None` without renaming
+    /// when the handle is explicit (a chosen name is never auto-renamed) or when `held` is
+    /// already stale (another link renamed for this same collision first, so there is nothing
+    /// new to announce).
+    fn try_bump(&self, held: &str) -> Option<String> {
+        if self.explicit {
+            return None;
+        }
+        let generation = self.generation.load(Ordering::Relaxed);
+        if self.name_at(generation) != held {
+            return None;
+        }
+        self.generation.store(generation + 1, Ordering::Relaxed);
+        Some(self.name_at(generation + 1))
+    }
+
+    /// Renders the handle at a disambiguation generation (1 = the bare base name).
+    fn name_at(&self, generation: u32) -> String {
+        if generation == 1 { self.base.clone() } else { format!("{}-{generation}", self.base) }
     }
 }
 
@@ -879,29 +887,28 @@ impl BridgeCore {
                 *count
             };
             if drops == RAPID_DROP_DIAGNOSIS_THRESHOLD {
-                if self.session.explicit {
-                    self.notify(
-                        server,
-                        "link",
-                        &format!(
-                            "The link to `{server}` keeps dropping right after connecting — if another live session is using the handle `{session}`, the two supersede each other; start one with a distinct `--as`. Going quiet until the link stabilizes.",
-                            session = self.session.get()
-                        ),
-                    );
-                    return;
-                }
-                // A defaulted handle self-disambiguates (PRD-0018): rename, re-arm the breaker
-                // (a fleet racing for suffixes just bumps again), and let the next dial use the
-                // new name. In-flight dials with the old name may burn a drop or two first —
-                // suffixes can skip, but every fight ends.
                 let held = self.session.get();
-                let renamed = self.session.bump();
-                self.rapid_drops.remove(server);
-                self.notify(
-                    server,
-                    "link",
-                    &format!("Another live session holds the handle `{held}` — reconnecting to `{server}` as `{renamed}` (pass `--as` to pin a name)."),
-                );
+                let message = match self.session.try_bump(&held) {
+                    // A defaulted handle self-disambiguates (PRD-0018): rename, re-arm the
+                    // breaker (a still-fighting renamed handle just bumps again), and let the
+                    // next dial use the new name. In-flight dials with the old name may burn a
+                    // drop or two first — suffixes can skip, but every fight ends.
+                    Some(renamed) => {
+                        self.rapid_drops.remove(server);
+                        format!("Another live session holds the handle `{held}` — reconnecting to `{server}` as `{renamed}` (pass `--as` to pin a name).")
+                    }
+                    // An explicit `--as` is a deliberate choice: diagnose, never rename.
+                    None if self.session.explicit => format!(
+                        "The link to `{server}` keeps dropping right after connecting — if another live session is using the handle `{held}`, the two supersede each other; start one with a distinct `--as`. Going quiet until the link stabilizes."
+                    ),
+                    // Another link already renamed past `held` for this same collision — re-arm
+                    // quietly; this link's next dial picks up the new name.
+                    None => {
+                        self.rapid_drops.remove(server);
+                        return;
+                    }
+                };
+                self.notify(server, "link", &message);
                 return;
             }
             if drops > RAPID_DROP_DIAGNOSIS_THRESHOLD {

@@ -216,6 +216,32 @@ async fn spawn_fake_otlp_collector() -> (std::net::SocketAddr, tokio::sync::mpsc
     (collector_addr, hit_rx)
 }
 
+/// Spawns an `--ephemeral` serve wired to the fake collector, with the standard test auth header
+/// (base64 of `test-token`) that [`assert_otlp_authorized_post`] checks on arrival.
+fn spawn_otlp_serve(addr: SocketAddr, collector_addr: SocketAddr, extra_envs: &[(&str, &str)]) -> ServerProcess {
+    let mut command = Command::new(CONCLAVE_BIN);
+    command
+        .args(["serve", "--bind", &addr.to_string(), "--ephemeral"])
+        .env("CONCLAVE_OTLP_ENDPOINT", format!("http://{collector_addr}"))
+        // Authenticated collectors (e.g. Grafana Cloud) take the standard OTel headers env.
+        .env("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Basic dGVzdC10b2tlbg==")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (key, value) in extra_envs {
+        command.env(key, value);
+    }
+    ServerProcess(command.spawn().expect("failed to spawn `conclave serve`"))
+}
+
+/// The collector-side contract both signal tests share: a POST carrying the auth header.
+fn assert_otlp_authorized_post(head: &str) {
+    assert!(head.starts_with("POST"), "expected an OTLP POST, got: {head}");
+    assert!(
+        head.to_ascii_lowercase().contains("authorization: basic dgvzdc10b2tlbg=="),
+        "OTEL_EXPORTER_OTLP_HEADERS must reach the collector (Grafana Cloud auth): {head}"
+    );
+}
+
 /// Receives collector hits until one names the wanted signal path (e.g. `/v1/traces`).
 async fn otlp_hit_for(hit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>, signal_path: &str) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -235,32 +261,15 @@ async fn e2e_serve_exports_otlp_spans_when_endpoint_is_set() {
     let (collector_addr, mut hit_rx) = spawn_fake_otlp_collector().await;
 
     let addr = free_loopback_addr();
-    let _server = ServerProcess(
-        Command::new(CONCLAVE_BIN)
-            .args(["serve", "--bind", &addr.to_string(), "--ephemeral"])
-            .env("CONCLAVE_OTLP_ENDPOINT", format!("http://{collector_addr}"))
-            // Authenticated collectors (e.g. Grafana Cloud) take the standard OTel headers env.
-            .env("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Basic dGVzdC10b2tlbg==")
-            // The request spans are debug-level; export cadence tightened so the test is quick.
-            .env("RUST_LOG", "debug")
-            .env("OTEL_BSP_SCHEDULE_DELAY", "200")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn `conclave serve`"),
-    );
+    // The request spans are debug-level; export cadence tightened so the test is quick.
+    let _server = spawn_otlp_serve(addr, collector_addr, &[("RUST_LOG", "debug"), ("OTEL_BSP_SCHEDULE_DELAY", "200")]);
     wait_for_listener(addr).await;
 
     // Drive one instrumented request path so there is a span to export.
     let mut ws = ws_connect(addr).await;
     ws_register(&mut ws, &Identity::generate().unwrap(), "aaron", "workstation", "otel").await;
 
-    let head = otlp_hit_for(&mut hit_rx, "/v1/traces").await;
-    assert!(head.starts_with("POST"), "expected an OTLP trace POST, got: {head}");
-    assert!(
-        head.to_ascii_lowercase().contains("authorization: basic dgvzdc10b2tlbg=="),
-        "OTEL_EXPORTER_OTLP_HEADERS must reach the collector (Grafana Cloud auth): {head}"
-    );
+    assert_otlp_authorized_post(&otlp_hit_for(&mut hit_rx, "/v1/traces").await);
 }
 
 #[tokio::test]
@@ -268,27 +277,11 @@ async fn e2e_serve_exports_otlp_logs_when_endpoint_is_set() {
     let (collector_addr, mut hit_rx) = spawn_fake_otlp_collector().await;
 
     let addr = free_loopback_addr();
-    let _server = ServerProcess(
-        Command::new(CONCLAVE_BIN)
-            .args(["serve", "--bind", &addr.to_string(), "--ephemeral"])
-            .env("CONCLAVE_OTLP_ENDPOINT", format!("http://{collector_addr}"))
-            .env("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Basic dGVzdC10b2tlbg==")
-            // The startup info event is the log record under test; batch cadence tightened.
-            .env("OTEL_BLRP_SCHEDULE_DELAY", "200")
-            .env("OTEL_BSP_SCHEDULE_DELAY", "200")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn `conclave serve`"),
-    );
+    // The startup info event is the log record under test; batch cadence tightened.
+    let _server = spawn_otlp_serve(addr, collector_addr, &[("OTEL_BLRP_SCHEDULE_DELAY", "200")]);
     wait_for_listener(addr).await;
 
-    let head = otlp_hit_for(&mut hit_rx, "/v1/logs").await;
-    assert!(head.starts_with("POST"), "expected an OTLP log POST, got: {head}");
-    assert!(
-        head.to_ascii_lowercase().contains("authorization: basic dgvzdc10b2tlbg=="),
-        "OTEL_EXPORTER_OTLP_HEADERS must reach the collector on the logs path too: {head}"
-    );
+    assert_otlp_authorized_post(&otlp_hit_for(&mut hit_rx, "/v1/logs").await);
 }
 
 #[test]
@@ -722,25 +715,30 @@ struct Bridge {
 }
 
 impl Bridge {
-    fn spawn(config_dir: &Path, url: &str, session: &str) -> Self {
+    fn base_command(config_dir: &Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(CONCLAVE_BIN);
-        command.args(["bridge", "--config-dir", config_dir.to_str().unwrap(), "--server", url, "--as", session]);
+        command.args(["bridge", "--config-dir", config_dir.to_str().unwrap()]);
+        command
+    }
+
+    fn spawn(config_dir: &Path, url: &str, session: &str) -> Self {
+        let mut command = Self::base_command(config_dir);
+        command.args(["--server", url, "--as", session]);
         Self::from_command(command)
     }
 
     /// Spawns a bridge that connects to *all* servers in its config (multi-home).
     fn spawn_all(config_dir: &Path, session: &str) -> Self {
-        let mut command = tokio::process::Command::new(CONCLAVE_BIN);
-        command.args(["bridge", "--config-dir", config_dir.to_str().unwrap(), "--as", session]);
+        let mut command = Self::base_command(config_dir);
+        command.args(["--as", session]);
         Self::from_command(command)
     }
 
     /// Spawns a bridge with no `--as`, so the handle defaults from `cwd` — the shared-MCP-config
     /// shape that collides when several sessions run in one project directory (PRD-0018).
     fn spawn_defaulted(config_dir: &Path, url: &str, cwd: &Path) -> Self {
-        let mut command = tokio::process::Command::new(CONCLAVE_BIN);
-        command.args(["bridge", "--config-dir", config_dir.to_str().unwrap(), "--server", url]);
-        command.current_dir(cwd);
+        let mut command = Self::base_command(config_dir);
+        command.args(["--server", url]).current_dir(cwd);
         Self::from_command(command)
     }
 
@@ -1218,20 +1216,18 @@ async fn e2e_bridge_collision_renames_the_defaulted_latecomer() {
     // Either bridge may be the one that trips the breaker and renames; poll presence until two
     // distinct `fleet*` sessions are live at once. The rename rides the reconnect backoff, so
     // the deadline is generous; a poll landing mid-fight (link down → tool error) just retries.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
     let mut id = 100;
-    let settled = loop {
-        if tokio::time::Instant::now() >= deadline {
-            break String::new();
+    timeout(Duration::from_secs(75), async {
+        loop {
+            id += 1;
+            let who = first.call(id, "who", json!({})).await;
+            let text = who.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
+            if text.matches("aaron/workstation/fleet").count() == 2 && text.contains("aaron/workstation/fleet-2") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        id += 1;
-        let who = first.call(id, "who", json!({})).await;
-        let text = who.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
-        if text.matches("aaron/workstation/fleet").count() == 2 && text.contains("aaron/workstation/fleet-2") {
-            break text.to_owned();
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    };
-    assert!(!settled.is_empty(), "the collision never settled into two distinct live handles");
-    drop(second);
+    })
+    .await
+    .expect("the collision never settled into two distinct live handles");
 }

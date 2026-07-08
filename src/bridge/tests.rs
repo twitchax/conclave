@@ -36,7 +36,6 @@ impl NotificationSink for CapturingSink {
 
 struct Harness {
     core: BridgeCore,
-    session: SessionHandle,
     to_mcp_rx: mpsc::UnboundedReceiver<Value>,
     to_server_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     injections: Arc<Mutex<Vec<Injection>>>,
@@ -68,7 +67,7 @@ fn harness_with_session(config: Config, session: SessionHandle) -> Harness {
     let (to_mcp_tx, to_mcp_rx) = mpsc::unbounded_channel();
     let injections = Arc::new(Mutex::new(Vec::new()));
     let sink = Box::new(CapturingSink { injections: Arc::clone(&injections) });
-    let mut core = BridgeCore::new(config, session.clone(), to_mcp_tx, sink);
+    let mut core = BridgeCore::new(config, session, to_mcp_tx, sink);
 
     let (to_server_tx, to_server_rx) = mpsc::unbounded_channel();
     let joined = Arc::new(Mutex::new(HashSet::new()));
@@ -84,11 +83,19 @@ fn harness_with_session(config: Config, session: SessionHandle) -> Harness {
 
     Harness {
         core,
-        session,
         to_mcp_rx,
         to_server_rx,
         injections,
         joined,
+    }
+}
+
+/// Drives `times` instant up→down flaps of `s1` (1s uptime — well under the stability window).
+async fn flap(harness: &mut Harness, times: u32) {
+    for _ in 0..times {
+        harness.core.handle_link_event("s1", client::LinkEvent::Up);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        harness.core.handle_link_event("s1", client::LinkEvent::Down);
     }
 }
 
@@ -626,28 +633,18 @@ async fn bridge_link_flapping_diagnoses_a_handle_conflict_and_quiets_down() {
     let mut harness = harness(make_config(PermissionLevel::Notify, vec![]));
 
     // The first two instant drops keep the normal notices…
-    for _ in 0..2 {
-        harness.core.handle_link_event("s1", client::LinkEvent::Up);
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        harness.core.handle_link_event("s1", client::LinkEvent::Down);
-    }
+    flap(&mut harness, 2).await;
     let texts = drain_notice_texts(&mut harness.to_mcp_rx);
     assert!(texts.iter().any(|t| t.contains("Disconnected")), "early drops keep the normal notice: {texts:?}");
     assert!(!texts.iter().any(|t| t.contains("--as")), "no diagnosis before the threshold: {texts:?}");
 
     // …the third diagnoses the likely handle conflict, once, with the remedy…
-    harness.core.handle_link_event("s1", client::LinkEvent::Up);
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    harness.core.handle_link_event("s1", client::LinkEvent::Down);
+    flap(&mut harness, 1).await;
     let texts = drain_notice_texts(&mut harness.to_mcp_rx);
     assert!(texts.iter().any(|t| t.contains("--as")), "the third instant drop must diagnose the handle conflict: {texts:?}");
 
     // …further flapping is quiet…
-    for _ in 0..3 {
-        harness.core.handle_link_event("s1", client::LinkEvent::Up);
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        harness.core.handle_link_event("s1", client::LinkEvent::Down);
-    }
+    flap(&mut harness, 3).await;
     assert!(drain_notice_texts(&mut harness.to_mcp_rx).is_empty(), "flapping past the threshold must not stream notices");
 
     // …until a link survives the stability window: the breaker resets, notices resume.
@@ -668,25 +665,17 @@ async fn bridge_link_flapping_renames_a_defaulted_handle() {
 
     // Three instant drops: the breaker trips and, because the handle was defaulted (no --as),
     // the bridge renames itself instead of only advising.
-    for _ in 0..3 {
-        harness.core.handle_link_event("s1", client::LinkEvent::Up);
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        harness.core.handle_link_event("s1", client::LinkEvent::Down);
-    }
+    flap(&mut harness, 3).await;
     let texts = drain_notice_texts(&mut harness.to_mcp_rx);
     assert!(texts.iter().any(|t| t.contains("razel-2")), "the tripped breaker must announce the renamed handle: {texts:?}");
-    assert_eq!(harness.session.get(), "razel-2", "the shared handle must carry the new name for the next dial");
+    assert_eq!(harness.core.session.get(), "razel-2", "the shared handle must carry the new name for the next dial");
 
     // If the renamed handle *also* fights (a fleet racing for suffixes), the re-armed breaker
     // bumps again.
-    for _ in 0..3 {
-        harness.core.handle_link_event("s1", client::LinkEvent::Up);
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        harness.core.handle_link_event("s1", client::LinkEvent::Down);
-    }
+    flap(&mut harness, 3).await;
     let texts = drain_notice_texts(&mut harness.to_mcp_rx);
     assert!(texts.iter().any(|t| t.contains("razel-3")), "a still-fighting renamed handle must bump again: {texts:?}");
-    assert_eq!(harness.session.get(), "razel-3");
+    assert_eq!(harness.core.session.get(), "razel-3");
 }
 
 // -----------------------------------------------------------------------------
