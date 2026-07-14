@@ -304,7 +304,7 @@ async fn server_machine_add_key_still_proves_possession_at_auth() {
 
     // An impostor key that was never enrolled is refused — enrollment alone grants nothing.
     let mut evil = Client::connect(&hub);
-    assert!(is_unauthorized(&evil.authenticate(&impostor, "onthego").await), "an unenrolled key must not authenticate",);
+    assert!(is_unauthorized(&evil.authenticate(&impostor, "onthego").await), "an unenrolled key must not authenticate");
 }
 
 #[tokio::test]

@@ -33,9 +33,9 @@ const REAP_INTERVAL: Duration = Duration::from_secs(15);
 /// How long a session may go without any inbound frame before it is reaped (DESIGN.md §10).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Retained-history window: messages older than this are purged (PRD-0013, constant in v1).
-const HISTORY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const HISTORY_RETENTION: Duration = Duration::from_hours(7 * 24);
 /// How often the retention sweep runs.
-const HISTORY_PURGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const HISTORY_PURGE_INTERVAL: Duration = Duration::from_hours(1);
 
 /// The operator-supplied `serve` configuration (DESIGN.md §7, §13).
 pub struct ServerConfig {
