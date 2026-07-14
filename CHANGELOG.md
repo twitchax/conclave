@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The file is maintained with
 [git-cliff](https://git-cliff.org/) (`cargo make changelog`).
 
+## [0.3.8] - 2026-07-14
+
+### Changed
+
+- **Toolchain bumped to `nightly-2026-07-14`** (rustc 1.99), up from the seven-month-old
+  `nightly-2025-12-22`. The `rust-toolchain.toml` pin and its three CI/release mirrors move in
+  lockstep. The jump surfaced two new `clippy::pedantic` lints, both fixed with no runtime
+  change: the history-retention constants now use `Duration::from_hours` instead of `from_secs`,
+  and a stray trailing comma is dropped from a test assertion. No user-facing behavior change.
+
 ## [0.3.7] - 2026-07-08
 
 ### Changed
